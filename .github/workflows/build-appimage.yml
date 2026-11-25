@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -36,7 +36,7 @@ jobs:
       - name: Compute version
         id: ver
         run: |
-          if [[ "$GITHUB_REF_NAME" == v* ]]; then
+          if [ "${GITHUB_REF_NAME:0:1}" = "v" ]; then
             echo "version=$(echo $GITHUB_REF_NAME | sed s/^v//)" >> "$GITHUB_OUTPUT"
           else
             echo "version=0.0.0-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
