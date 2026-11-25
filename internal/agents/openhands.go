@@ -47,7 +47,7 @@ func (o *openhands) Enable(opts Options) error {
 	}
 
 	cfg := o.buildConfig(opts)
-	return atomicWrite(path, cfg)
+	return atomicWrite(path, []byte(cfg))
 }
 
 func (o *openhands) Disable() error {
@@ -58,7 +58,6 @@ func (o *openhands) Disable() error {
 			return atomicWrite(path, data)
 		}
 	}
-	// 无备份：仅删除 zen-gate 管理的 block（若有）
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
@@ -67,28 +66,19 @@ func (o *openhands) Disable() error {
 	return atomicWrite(path, []byte(clean))
 }
 
-// buildConfig 生成 OpenHands 的 config.toml 内容，包含 zen-gate 管理标记。
 func (o *openhands) buildConfig(opts Options) string {
 	var b strings.Builder
-	b.WriteString("# >>> zen-gate managed block (do not edit)
-")
-	b.WriteString("[llm]
-")
-	b.WriteString(fmt.Sprintf("model = %q
-", opts.DefaultModel))
-	b.WriteString(fmt.Sprintf("api_key = %q
-", opts.APIKey))
-	b.WriteString(fmt.Sprintf("base_url = %q
-", strings.TrimSuffix(opts.BaseURL, "/v1")))
-	b.WriteString("# <<< zen-gate managed block
-")
+	b.WriteString("# >>> zen-gate managed block (do not edit)\n")
+	b.WriteString("[llm]\n")
+	b.WriteString(fmt.Sprintf("model = %q\n", opts.DefaultModel))
+	b.WriteString(fmt.Sprintf("api_key = %q\n", opts.APIKey))
+	b.WriteString(fmt.Sprintf("base_url = %q\n", strings.TrimSuffix(opts.BaseURL, "/v1")))
+	b.WriteString("# <<< zen-gate managed block\n")
 	return b.String()
 }
 
-// stripZenGateBlock 移除 zen-gate 管理的 [llm] block，保留用户原有内容。
 func stripZenGateBlock(src string) string {
-	lines := strings.Split(src, "
-")
+	lines := strings.Split(src, "\n")
 	out := make([]string, 0, len(lines))
 	inBlock := false
 	for _, line := range lines {
@@ -104,10 +94,7 @@ func stripZenGateBlock(src string) string {
 			out = append(out, line)
 		}
 	}
-	return strings.TrimRight(strings.Join(out, "
-"), "
-")
+	return strings.TrimRight(strings.Join(out, "\n"), "\n")
 }
 
-// 确保 openhands 实现了 Agent 接口。
 var _ Agent = (*openhands)(nil)
