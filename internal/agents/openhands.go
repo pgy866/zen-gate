@@ -2,10 +2,8 @@ package agents
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // openhands 向 OpenHands Agent Canvas 写入 LLM 配置，使其模型选择器
