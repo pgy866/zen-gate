@@ -35,7 +35,7 @@ func (o *openhands) IsEnabled() (bool, string, error) {
 	if err != nil {
 		return false, "", nil
 	}
-	return strings.Contains(string(data), "zen-gate"), "", nil
+	return strings.Contains(string(data), "zen_gate_managed"), "", nil
 }
 
 func (o *openhands) Enable(opts Options) error {
