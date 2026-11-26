@@ -1,25 +1,26 @@
 package agents
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
-// openhands 向 OpenHands（原 OpenDevin）写入 LLM 配置，使其模型选择器
+// openhands 向 OpenHands Agent Canvas 写入 LLM 配置，使其模型选择器
 // 指向 zen-gate 本地网关。配置文件先备份，关闭即还原。
 type openhands struct{}
 
 func newOpenHands() *openhands { return &openhands{} }
 
 func (o *openhands) Meta() (string, string, string) {
-	return "openhands", "OpenHands", "~/.openhands/config.toml 的 [llm] 指向本地网关（原值自动备份还原）"
+	return "openhands", "OpenHands", "~/.openhands/settings.json 的 agent_settings.llm 指向本地网关（原值自动备份还原）"
 }
 
 func (o *openhands) configDir() string { return homePath(".openhands") }
 func (o *openhands) configPath() string {
-	return filepath.Join(o.configDir(), "config.toml")
+	return filepath.Join(o.configDir(), "settings.json")
 }
 
 func (o *openhands) Detect() (bool, string, string) {
@@ -34,7 +35,7 @@ func (o *openhands) IsEnabled() (bool, string, error) {
 	if err != nil {
 		return false, "", nil
 	}
-	return strings.Contains(string(data), "# >>> zen-gate"), "", nil
+	return strings.Contains(string(data), "zen-gate"), "", nil
 }
 
 func (o *openhands) Enable(opts Options) error {
@@ -46,13 +47,48 @@ func (o *openhands) Enable(opts Options) error {
 		return err
 	}
 
-	cfg := o.buildConfig(opts)
-	return atomicWrite(path, []byte(cfg))
+	// 读取现有 settings.json
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	var settings map[string]interface{}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return err
+	}
+
+	// 确保 agent_settings 存在
+	agentSettings, ok := settings["agent_settings"].(map[string]interface{})
+	if !ok {
+		agentSettings = make(map[string]interface{})
+		settings["agent_settings"] = agentSettings
+	}
+
+	// 确保 llm 存在
+	llm, ok := agentSettings["llm"].(map[string]interface{})
+	if !ok {
+		llm = make(map[string]interface{})
+		agentSettings["llm"] = llm
+	}
+
+	// 设置 zen-gate 配置
+	llm["model"] = opts.DefaultModel
+	llm["api_key"] = opts.APIKey
+	llm["base_url"] = opts.BaseURL
+	// 标记 zen-gate 管理
+	agentSettings["zen_gate_managed"] = true
+
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWrite(path, out)
 }
 
 func (o *openhands) Disable() error {
 	path := o.configPath()
-	if b := latestBackup("openhands", "config.toml"); b != "" {
+	if b := latestBackup("openhands", "settings.json"); b != "" {
 		data, err := os.ReadFile(b)
 		if err == nil {
 			return atomicWrite(path, data)
@@ -62,39 +98,19 @@ func (o *openhands) Disable() error {
 	if err != nil {
 		return nil
 	}
-	clean := stripZenGateBlock(string(data))
-	return atomicWrite(path, []byte(clean))
-}
-
-func (o *openhands) buildConfig(opts Options) string {
-	var b strings.Builder
-	b.WriteString("# >>> zen-gate managed block (do not edit)\n")
-	b.WriteString("[llm]\n")
-	b.WriteString(fmt.Sprintf("model = %q\n", opts.DefaultModel))
-	b.WriteString(fmt.Sprintf("api_key = %q\n", opts.APIKey))
-	b.WriteString(fmt.Sprintf("base_url = %q\n", strings.TrimSuffix(opts.BaseURL, "/v1")))
-	b.WriteString("# <<< zen-gate managed block\n")
-	return b.String()
-}
-
-func stripZenGateBlock(src string) string {
-	lines := strings.Split(src, "\n")
-	out := make([]string, 0, len(lines))
-	inBlock := false
-	for _, line := range lines {
-		t := strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(t, "# >>> zen-gate"):
-			inBlock = true
-			continue
-		case strings.HasPrefix(t, "# <<< zen-gate"):
-			inBlock = false
-			continue
-		case !inBlock:
-			out = append(out, line)
-		}
+	var settings map[string]interface{}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return nil
 	}
-	return strings.TrimRight(strings.Join(out, "\n"), "\n")
+	agentSettings, ok := settings["agent_settings"].(map[string]interface{})
+	if ok {
+		delete(agentSettings, "zen_gate_managed")
+	}
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return nil
+	}
+	return atomicWrite(path, out)
 }
 
 var _ Agent = (*openhands)(nil)
