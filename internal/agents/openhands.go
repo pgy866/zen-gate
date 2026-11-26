@@ -35,7 +35,16 @@ func (o *openhands) IsEnabled() (bool, string, error) {
 	if err != nil {
 		return false, "", nil
 	}
-	return strings.Contains(string(data), "zen_gate_managed"), "", nil
+	var settings map[string]interface{}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return false, "", nil
+	}
+	agentSettings, ok := settings["agent_settings"].(map[string]interface{})
+	if !ok {
+		return false, "", nil
+	}
+	managed, _ := agentSettings["zen_gate_managed"].(bool)
+	return managed, "", nil
 }
 
 func (o *openhands) Enable(opts Options) error {
