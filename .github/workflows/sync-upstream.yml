@@ -1,4 +1,4 @@
-name: sync upstream
+name: 同步上游
 
 on:
   schedule:
@@ -10,29 +10,30 @@ permissions:
 
 jobs:
   sync:
+    name: 镜像同步
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Configure git
+      - name: 配置 Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Add upstream and fetch all
+      - name: 添加上游并获取所有
         run: |
           git remote add upstream https://github.com/LAGcomcom/zen-gate.git || true
           git fetch upstream --tags --prune
 
-      - name: Push all branches to fork (preserve history)
+      - name: 推送所有分支到 Fork (保留历史)
         run: |
           git push origin upstream/master:master 2>&1 || true
           git push origin upstream/feat/linux-port:feat/linux-port 2>&1 || true
           git push origin --tags 2>&1 || true
 
-      - name: Sync releases with metadata and assets
+      - name: 同步 Release 元数据与资源
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -40,11 +41,11 @@ jobs:
           # 获取上游所有 release 信息 (tag, name, body, publishedAt)
           upstream_releases=$(gh api repos/LAGcomcom/zen-gate/releases --paginate --jq ".[] | [.tag_name, .name, .body, .published_at, .created_at] | @tsv")
           echo "$upstream_releases" | while IFS=$'\t' read -r tag name body published_at created_at; do
-            echo "=== Syncing $tag ==="
+            echo "=== 同步 $tag ==="
             # 获取上游 release 详情
-            upstream_body=$(gh api "repos/LAGcomcom/zen-gate/releases/tags/$tag" --jq ".body // """ 2>/dev/null || echo "")
-            upstream_published=$(gh api "repos/LAGcomcom/zen-gate/releases/tags/$tag" --jq ".published_at // """ 2>/dev/null || echo "")
-            upstream_title=$(gh api "repos/LAGcomcom/zen-gate/releases/tags/$tag" --jq ".name // """ 2>/dev/null || echo "")
+            upstream_body=$(gh api "repos/LAGcomcom/zen-gate/releases/tags/$tag" --jq ".body // \"\"" 2>/dev/null || echo "")
+            upstream_published=$(gh api "repos/LAGcomcom/zen-gate/releases/tags/$tag" --jq ".published_at // \"\"" 2>/dev/null || echo "")
+            upstream_title=$(gh api "repos/LAGcomcom/zen-gate/releases/tags/$tag" --jq ".name // \"\"" 2>/dev/null || echo "")
 
             # 检查 fork 是否已有该 release
             existing_release=$(gh api "repos/${{ github.repository }}/releases/tags/$tag" 2>/dev/null || echo "")
@@ -69,7 +70,7 @@ jobs:
               # 上传到 fork（--clobber 覆盖同名文件）
               gh release upload "$tag" /tmp/release-assets/* --repo ${{ github.repository }} --clobber 2>&1 || true
             else
-              echo "WARN: download failed for $tag, skipping assets"
+              echo "警告: $tag 下载失败，跳过 assets"
             fi
             rm -rf /tmp/release-assets
           done
