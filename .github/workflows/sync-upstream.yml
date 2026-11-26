@@ -32,24 +32,41 @@ jobs:
           git push origin upstream/feat/linux-port:feat/linux-port 2>&1 || true
           git push origin --tags 2>&1 || true
 
-      - name: Sync releases with assets
+      - name: Sync releases with metadata and assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          # 获取上游所有 release tag
-          upstream_tags=$(gh release list --repo LAGcomcom/zen-gate --limit 100 --json tagName -q ".[].tagName")
-          for tag in $upstream_tags; do
+          # 获取上游所有 release 信息 (tag, name, body, publishedAt)
+          upstream_releases=$(gh api repos/LAGcomcom/zen-gate/releases --paginate --jq ".[] | [.tag_name, .name, .body, .published_at, .created_at] | @tsv")
+          echo "$upstream_releases" | while IFS=$'\t' read -r tag name body published_at created_at; do
             echo "=== Syncing $tag ==="
+            # 获取上游 release 详情
+            upstream_body=$(gh api "repos/LAGcomcom/zen-gate/releases/tags/$tag" --jq ".body // """ 2>/dev/null || echo "")
+            upstream_published=$(gh api "repos/LAGcomcom/zen-gate/releases/tags/$tag" --jq ".published_at // """ 2>/dev/null || echo "")
+            upstream_title=$(gh api "repos/LAGcomcom/zen-gate/releases/tags/$tag" --jq ".name // """ 2>/dev/null || echo "")
+
             # 检查 fork 是否已有该 release
-            if ! gh release view "$tag" --repo ${{ github.repository }} >/dev/null 2>&1; then
-              # 创建 release（先不带 assets）
-              gh release create "$tag" --repo ${{ github.repository }} --title "$tag" --notes "同步自上游 LAGcomcom/zen-gate" 2>&1 || true
+            existing_release=$(gh api "repos/${{ github.repository }}/releases/tags/$tag" 2>/dev/null || echo "")
+            if [ -z "$existing_release" ]; then
+              # 创建 release（带上游的标题和描述）
+              gh release create "$tag" --repo ${{ github.repository }} --title "${upstream_title:-$tag}" --notes "${upstream_body:-同步自上游 LAGcomcom/zen-gate}" 2>&1 || true
+            else
+              # 更新 release 标题和描述（保留上游原始记录）
+              release_id=$(gh api "repos/${{ github.repository }}/releases/tags/$tag" --jq ".id")
+              gh api --method PATCH "repos/${{ github.repository }}/releases/$release_id" -f name="${upstream_title:-$tag}" -f body="${upstream_body:-同步自上游 LAGcomcom/zen-gate}" 2>&1 || true
             fi
+
+            # 同步发布时间（保留上游原始发布时间）
+            release_id=$(gh api "repos/${{ github.repository }}/releases/tags/$tag" --jq ".id" 2>/dev/null || echo "")
+            if [ -n "$release_id" ] && [ -n "$upstream_published" ]; then
+              gh api --method PATCH "repos/${{ github.repository }}/releases/$release_id" -f published_at="$upstream_published" 2>&1 || true
+            fi
+
             # 下载上游 assets
             rm -rf /tmp/release-assets && mkdir -p /tmp/release-assets
             if gh release download "$tag" --repo LAGcomcom/zen-gate --dir /tmp/release-assets 2>&1; then
-              # 上传到 fork
+              # 上传到 fork（--clobber 覆盖同名文件）
               gh release upload "$tag" /tmp/release-assets/* --repo ${{ github.repository }} --clobber 2>&1 || true
             else
               echo "WARN: download failed for $tag, skipping assets"
