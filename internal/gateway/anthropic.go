@@ -12,20 +12,20 @@ import (
 // Anthropic /v1/messages, for Claude-protocol clients (Claude Code and kin).
 
 type anthropicContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-	Title string `json:"title"`
+	Type   string `json:"type"`
+	Text   string `json:"text"`
+	Title  string `json:"title"`
 	Source *struct {
 		Type      string `json:"type"`
 		MediaType string `json:"media_type"`
 		Data      string `json:"data"`
 	} `json:"source"`
-	ID      string          `json:"id"`
-	Name    string          `json:"name"`
-	Input   json.RawMessage `json:"input"`
-	ToolUseID string        `json:"tool_use_id"`
-	Content json.RawMessage `json:"content"`
-	IsError bool            `json:"is_error"`
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Input     json.RawMessage `json:"input"`
+	ToolUseID string          `json:"tool_use_id"`
+	Content   json.RawMessage `json:"content"`
+	IsError   bool            `json:"is_error"`
 }
 
 type anthropicMessage struct {
@@ -39,18 +39,42 @@ type anthropicToolDef struct {
 	InputSchema json.RawMessage `json:"input_schema"`
 }
 
+// anthropicEffortDeclared reads the thinking level out of an Anthropic request.
+// The wire states a token budget, not a rung, so the budget maps onto the
+// gateway's levels — and an explicit "disabled" stays "none" instead of
+// collapsing into the lightest rung, which still thinks.
+func anthropicEffortDeclared(req anthropicRequest) string {
+	if req.Thinking == nil {
+		return ""
+	}
+	switch req.Thinking.Type {
+	case "disabled":
+		return "none"
+	case "enabled":
+		switch b := req.Thinking.BudgetTokens; {
+		case b > 8192:
+			return "deep"
+		case b > 2048:
+			return "balanced"
+		case b > 0:
+			return "light"
+		}
+	}
+	return ""
+}
+
 type anthropicRequest struct {
-	Model     string               `json:"model"`
-	MaxTokens int                  `json:"max_tokens"`
-	System    json.RawMessage      `json:"system"`
-	Messages  []anthropicMessage   `json:"messages"`
-	Tools     []anthropicToolDef   `json:"tools"`
-	Stream    bool                 `json:"stream"`
+	Model     string             `json:"model"`
+	MaxTokens int                `json:"max_tokens"`
+	System    json.RawMessage    `json:"system"`
+	Messages  []anthropicMessage `json:"messages"`
+	Tools     []anthropicToolDef `json:"tools"`
+	Stream    bool               `json:"stream"`
 	Thinking  *struct {
 		Type         string `json:"type"`
 		BudgetTokens int    `json:"budget_tokens"`
 	} `json:"thinking"`
-	Metadata  *struct {
+	Metadata *struct {
 		UserID string `json:"user_id"`
 	} `json:"metadata"`
 }
@@ -153,7 +177,7 @@ type anthropicStreamState struct {
 
 func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	var req anthropicRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody)).Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]any{"type": "error", "error": map[string]any{"type": "invalid_request_error", "message": err.Error()}})
 		return
 	}
@@ -171,17 +195,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	turn := TurnSeed(unified)
 	model := req.Model
 	needs := lane.SummarizeNeeds(unified, len(req.Tools))
-	effortDeclared := ""
-	if req.Thinking != nil && req.Thinking.Type == "enabled" && req.Thinking.BudgetTokens > 0 {
-		switch b := req.Thinking.BudgetTokens; {
-		case b > 8192:
-			effortDeclared = "deep"
-		case b > 2048:
-			effortDeclared = "balanced"
-		default:
-			effortDeclared = "light"
-		}
-	}
+	effortDeclared := anthropicEffortDeclared(req)
 	effort := s.resolveEffort(model, effortDeclared)
 	base := lane.BaseModelId(model)
 	tools := []lane.ToolDef{}
@@ -237,16 +251,28 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}
 	st.sse = sse
 	msgID := randomID("msg_")
-	sse.event(map[string]any{"type": "message_start", "message": map[string]any{
-		"id": msgID, "type": "message", "role": "assistant", "model": base,
-		"content": []any{}, "stop_sequence": nil, "stop_reason": nil,
-		"usage": map[string]any{"input_tokens": 0, "output_tokens": 0}}})
+	// message_start commits the 200 and the event-stream type, so it waits for
+	// the first chunk: a lane that refuses before speaking can then still answer
+	// with the status and Retry-After agents back off on.
+	begin := func() {
+		if sse.flushed {
+			return
+		}
+		sse.typedEvent(map[string]any{"type": "message_start", "message": map[string]any{
+			"id": msgID, "type": "message", "role": "assistant", "model": base,
+			"content": []any{}, "stop_sequence": nil, "stop_reason": nil,
+			"usage": map[string]any{"input_tokens": 0, "output_tokens": 0}}})
+	}
+	feed := func(c lane.Chunk) {
+		begin()
+		st.consume(c)
+	}
 
 	outcome, uerr := s.Lane.Complete(ctx, lane.Request{
 		Model: model, Effort: effort, Messages: unified, Tools: tools,
 		MaxTokens: req.MaxTokens, SessionSeed: seed, TurnSeed: turn,
-			Agent: agent, Needs: needs,
-	}, st.consume)
+		Agent: agent, Needs: needs,
+	}, feed)
 	stop := "end_turn"
 	switch {
 	case outcome.Finish == lane.FinishToolCalls:
@@ -262,7 +288,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			}
 			if usage, finish, _, _, ok := s.providerFallback(ctx,
 				s.providerFallbackPicks(needs, base), unified, tools,
-				fbMaxTok, agent, st.consume); ok {
+				fbMaxTok, agent, feed); ok {
 				stop := "end_turn"
 				switch {
 				case finish == lane.FinishToolCalls:
@@ -270,20 +296,29 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 				case finish == lane.FinishMaxTokens || finish == "":
 					stop = "max_tokens"
 				}
-				sse.event(map[string]any{"type": "message_delta",
+				begin()
+				sse.typedEvent(map[string]any{"type": "message_delta",
 					"delta": map[string]any{"stop_reason": stop, "stop_sequence": nil},
-					"usage": map[string]any{"output_tokens": usage.Output}})
-				sse.event(map[string]any{"type": "message_stop"})
+					"usage": anthropicUsage(usage)})
+				sse.typedEvent(map[string]any{"type": "message_stop"})
 				return
 			}
 		}
-		sse.event(map[string]any{"type": "error", "error": map[string]any{"type": errorType(uerr), "message": uerr.Message}})
+		if sse.flushed {
+			// Content (or a started fallback) already went on the wire, so the 200
+			// is committed: the refusal travels as an in-stream error event.
+			sse.typedEvent(map[string]any{"type": "error", "error": map[string]any{"type": errorType(uerr), "message": uerr.Message}})
+			return
+		}
+		setRetryAfter(w, uerr)
+		writeJSON(w, errorStatus(uerr), map[string]any{"type": "error", "error": map[string]any{"type": errorType(uerr), "message": uerr.Message}})
 		return
 	}
-	sse.event(map[string]any{"type": "message_delta",
+	begin()
+	sse.typedEvent(map[string]any{"type": "message_delta",
 		"delta": map[string]any{"stop_reason": stop, "stop_sequence": nil},
-		"usage": map[string]any{"output_tokens": outcome.Usage.Output}})
-	sse.event(map[string]any{"type": "message_stop"})
+		"usage": anthropicUsage(outcome.Usage)})
+	sse.typedEvent(map[string]any{"type": "message_stop"})
 }
 
 func (st *anthropicStreamState) consume(c lane.Chunk) {
@@ -295,26 +330,26 @@ func (st *anthropicStreamState) consume(c lane.Chunk) {
 		st.index++
 		switch c.BlockType {
 		case "text":
-			st.sse.event(map[string]any{"type": "content_block_start", "index": idx,
+			st.sse.typedEvent(map[string]any{"type": "content_block_start", "index": idx,
 				"content_block": map[string]any{"type": "text", "text": ""}})
 		case "reasoning":
-			st.sse.event(map[string]any{"type": "content_block_start", "index": idx,
+			st.sse.typedEvent(map[string]any{"type": "content_block_start", "index": idx,
 				"content_block": map[string]any{"type": "thinking", "thinking": ""}})
 		case "tool-call":
-			st.sse.event(map[string]any{"type": "content_block_start", "index": idx,
+			st.sse.typedEvent(map[string]any{"type": "content_block_start", "index": idx,
 				"content_block": map[string]any{"type": "tool_use", "id": c.ID, "name": c.Name, "input": json.RawMessage("{}")}})
 		}
 	case lane.ChunkTextDelta:
-		st.sse.event(map[string]any{"type": "content_block_delta", "index": st.blockMap[c.Index],
+		st.sse.typedEvent(map[string]any{"type": "content_block_delta", "index": st.blockMap[c.Index],
 			"delta": map[string]any{"type": "text_delta", "text": c.Delta}})
 	case lane.ChunkReasonDelta:
-		st.sse.event(map[string]any{"type": "content_block_delta", "index": st.blockMap[c.Index],
+		st.sse.typedEvent(map[string]any{"type": "content_block_delta", "index": st.blockMap[c.Index],
 			"delta": map[string]any{"type": "thinking_delta", "thinking": c.Delta}})
 	case lane.ChunkToolCallDelta:
-		st.sse.event(map[string]any{"type": "content_block_delta", "index": st.blockMap[c.Index],
+		st.sse.typedEvent(map[string]any{"type": "content_block_delta", "index": st.blockMap[c.Index],
 			"delta": map[string]any{"type": "input_json_delta", "partial_json": c.Delta}})
 	case lane.ChunkBlockEnd:
-		st.sse.event(map[string]any{"type": "content_block_stop", "index": st.blockMap[c.Index]})
+		st.sse.typedEvent(map[string]any{"type": "content_block_stop", "index": st.blockMap[c.Index]})
 	}
 }
 
@@ -345,12 +380,28 @@ func anthropicResponse(id, model string, c *responsesCollector, outcome lane.Out
 	}
 	return map[string]any{
 		"id": id, "type": "message", "role": "assistant", "model": model,
-		"content":    content,
+		"content":     content,
 		"stop_reason": stop, "stop_sequence": nil,
-		"usage": map[string]any{
-			"input_tokens":  outcome.Usage.Input + outcome.Usage.CacheRead,
-			"output_tokens": outcome.Usage.Output,
-		},
-		"created": time.Now().Unix(),
+		"usage":       anthropicUsage(outcome.Usage),
+		"created":     time.Now().Unix(),
 	}
+}
+
+// anthropicUsage renders one usage block for the Anthropic wire. Everything a
+// prompt sends travels here: input_tokens is the UNCACHED part only, and the
+// hit / write portions each get their own field — that is this protocol's
+// meaning, so folding them together (input + cache) inflated every cache hit
+// into an extra input. output_tokens is the caller's to append.
+func anthropicUsage(u lane.Usage) map[string]any {
+	out := map[string]any{
+		"input_tokens":  u.InputFresh(),
+		"output_tokens": u.Output,
+	}
+	if u.CacheRead > 0 {
+		out["cache_read_input_tokens"] = u.CacheRead
+	}
+	if u.CacheWrite > 0 {
+		out["cache_creation_input_tokens"] = u.CacheWrite
+	}
+	return out
 }

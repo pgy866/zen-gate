@@ -4,8 +4,13 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"sort"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -13,14 +18,55 @@ import (
 // UpstreamBase is the gateway root; override for tests.
 var UpstreamBase = "https://opencode.ai"
 
-// ClientUA satisfies the gateway's User-Agent floor (>= 1.17).
-const ClientUA = "opencode/1.18.31"
+// ClientUA is the v2 fingerprint the free-tier gate expects
+// (opencode/<channel>/<version>/<client>).
+const ClientUA = "opencode/latest/2.1.3/cli"
 
-// FingerprintTools is the lowercase tool quartet the free tier requires.
-var FingerprintTools = []string{"bash", "glob", "grep", "read"}
+// FingerprintTools is the tool pair the v2 free-tier gate requires: OpenCode's
+// own `read` and `shell`, declared with their exact descriptions and parameter
+// schemas (9router PR #4842). Case variants like Claude's `Read` pass through
+// untouched; a tool already using an exact fingerprint name with a different
+// definition travels under an alias.
+var FingerprintTools = []string{"read", "shell"}
 
-// quartetDonors maps a required slot to real tool names that can answer for it.
-var quartetDonors = map[string][]string{"bash": {"pwsh"}}
+// Verbatim from the OpenCode v2.0.26 CLI. Upstream compares description and
+// parameters, so do not reword or reformat these.
+const (
+	realReadDesc = "Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files."
+
+	realShellDesc = "Execute a shell command and return its output. Commands run on Linux using bash. Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete."
+)
+
+// fingerprintDefs returns the exact read/shell definitions keyed by name.
+// Values are rebuilt per call so callers cannot mutate the shared schema.
+func fingerprintDefs(name string) (desc string, params map[string]any, ok bool) {
+	switch name {
+	case "read":
+		return realReadDesc, map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":   map[string]any{"type": "string", "description": "File or directory to read"},
+				"offset": map[string]any{"type": "integer", "minimum": 0, "description": "The line or directory entry to start reading from (1-based)"},
+				"limit":  map[string]any{"type": "integer", "minimum": 0, "description": "The maximum number of lines or directory entries to read (defaults to and capped at 2000)"},
+			},
+			"required":             []any{"path"},
+			"additionalProperties": false,
+		}, true
+	case "shell":
+		return realShellDesc, map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command":    map[string]any{"type": "string", "description": "Shell command string to execute"},
+				"workdir":    map[string]any{"type": "string", "description": "Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead."},
+				"timeout":    map[string]any{"type": "integer", "minimum": 0, "description": "Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default."},
+				"background": map[string]any{"type": "boolean", "description": "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion."},
+			},
+			"required":             []any{"command"},
+			"additionalProperties": false,
+		}, true
+	}
+	return "", nil, false
+}
 
 var (
 	responsesModels = map[string]bool{
@@ -50,7 +96,7 @@ var lastStamp atomic.Int64
 var seqCounter atomic.Int64
 
 // MintSessionId mints a gateway-shaped canonical session id
-// (time-prefixed, monotonic counter), matching upstream.js byte for byte.
+// (time-prefixed, monotonic counter), byte for byte the shape a real client mints.
 func MintSessionId(nowMS int64) string {
 	if nowMS <= 0 {
 		nowMS = time.Now().UnixMilli()
@@ -89,6 +135,15 @@ func MintRequestId(nowMS int64) string {
 // SessionForConversation maps one downstream conversation onto one stable
 // upstream session. Free-tier quota is accounted per session, so a fresh id
 // per request would exhaust it and surface as 429.
+//
+// The id must be MINTED, not hashed: since the free-tier gate moved into the
+// private inference proxy, the service decodes the 12-hex prefix of
+// x-opencode-session as the truncated inverted ~(ms<<12|seq) of a real
+// OpenCode client and 403s (FreeTierError) any prefix that does not decode
+// to a fresh timestamp — a sha256-derived prefix never can (#47). One
+// conversation still gets exactly one session: the minted id is remembered
+// per seed and re-minted only when it grows too old for the freshness
+// window, so per-session quota and prompt cache keep working.
 func SessionForConversation(seed string) string {
 	seed = strings.TrimSpace(seed)
 	if sessionRe.MatchString(seed) {
@@ -97,8 +152,68 @@ func SessionForConversation(seed string) string {
 	if seed == "" {
 		seed = "global"
 	}
-	sum := sha256.Sum256([]byte("our-free-model\x00" + seed))
-	return "ses_" + hex.EncodeToString(sum[:6]) + base62From(sum[6:20])
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+	if s, ok := sessionsBySeed[seed]; ok && time.Since(s.at) < sessionRemintAfter {
+		return s.id
+	}
+	if len(sessionsBySeed) >= sessionsBySeedCap {
+		// The table is a stability cache, not state worth evicting
+		// carefully: a full reset only mints fresh ids for busy seeds.
+		sessionsBySeed = map[string]mintedSession{}
+	}
+	id := MintSessionId(0)
+	sessionsBySeed[seed] = mintedSession{id: id, at: time.Now()}
+	return id
+}
+
+type mintedSession struct {
+	id string
+	at time.Time
+}
+
+const (
+	sessionsBySeedCap = 4096
+	// The free-tier gate tolerates prefixes about a week old; re-mint at
+	// six days to stay inside the window even on sessions that never restart.
+	sessionRemintAfter = 6 * 24 * time.Hour
+)
+
+var (
+	sessionsMu     sync.Mutex
+	sessionsBySeed = map[string]mintedSession{}
+)
+
+// SessionForExit binds one conversation to one exit. Quota is accounted per
+// session AND per egress IP, so a session that appears from dozens of
+// countries is both an obvious fingerprint and a cache miss on every turn.
+func SessionForExit(seed, exitKey string) string {
+	if exitKey == "" {
+		return SessionForConversation(seed)
+	}
+	return SessionForConversation(seed + "\x00exit\x00" + exitKey)
+}
+
+// ReportExit books an (exit, model) failure against the live rotator.
+func ReportExit(nodeID, model, class string) {
+	if nodeID == "" || model == "" {
+		return
+	}
+	if r := CurrentRotator(); r != nil {
+		r.Report(nodeID, model, class)
+	}
+}
+
+// ReportDeadExit books one tunnel-level failure against a node. This is
+// node-granularity on purpose: a transport reset or timeout says nothing
+// about the model and everything about the tunnel it rode in on.
+func ReportDeadExit(nodeID string) {
+	if nodeID == "" {
+		return
+	}
+	if r := CurrentRotator(); r != nil {
+		r.ReportDead(nodeID)
+	}
 }
 
 // RequestIdFor derives a stable per-turn request id; retries of one turn share it.
@@ -106,7 +221,7 @@ func RequestIdFor(session, turnSeed string) string {
 	if strings.TrimSpace(turnSeed) == "" {
 		return MintRequestId(0)
 	}
-	sum := sha256.Sum256([]byte("our-free-model-req\x00" + session + "\x00" + turnSeed))
+	sum := sha256.Sum256([]byte("zen-gate-req\x00" + session + "\x00" + turnSeed))
 	id := "msg_" + hex.EncodeToString(sum[:6]) + base62From(sum[6:20])
 	if !requestRe.MatchString(id) {
 		return MintRequestId(0)
@@ -177,23 +292,26 @@ func isSystemOneModel(base string) bool { return systemOneRe.MatchString(base) }
 // IsSystemOneModel reports whether the id is a decision model.
 func IsSystemOneModel(modelID string) bool { return isSystemOneModel(BaseModelId(modelID)) }
 
-// EndpointFor returns the upstream path for one model.
+// EndpointFor returns the upstream path for one model. Free-tier inference
+// moved to /inference/v1 (zen-gate fork of 9router PR #4842).
 func EndpointFor(modelID string) string {
 	switch WireFor(modelID) {
 	case "responses":
-		return "/zen/v1/responses"
+		return "/inference/v1/responses"
 	case "messages":
-		return "/zen/v1/messages"
+		return "/inference/v1/messages"
 	case "systemone":
-		return "/zen/v1/systemone"
+		return "/inference/v1/systemone"
 	default:
-		return "/zen/v1/chat/completions"
+		return "/inference/v1/chat/completions"
 	}
 }
 
-// GatewayHeaders builds the header set the gateway fingerprints a genuine
-// desktop client by. "Bearer public" is the pooled free credential — there is
-// no per-user secret on this lane.
+// GatewayHeaders builds the header set the v2 free-tier gate fingerprints.
+// "Bearer public" is the pooled free credential — there is no per-user secret
+// on this lane. x-opencode-request is removed (upstream now rejects it);
+// x-opencode-session-id / x-session-affinity / x-session-id are the v2
+// session headers (9router PR #4842).
 func GatewayHeaders(session, requestID string, stream bool, accept string) map[string]string {
 	if accept == "" {
 		if stream {
@@ -203,15 +321,99 @@ func GatewayHeaders(session, requestID string, stream bool, accept string) map[s
 		}
 	}
 	return map[string]string{
-		"content-type":        "application/json",
-		"authorization":       "Bearer public",
-		"user-agent":          ClientUA,
-		"x-opencode-client":   "desktop",
-		"x-opencode-session":  session,
-		"x-opencode-request":  requestID,
-		"x-opencode-project":  "global",
-		"accept":              accept,
+		"content-type":          "application/json",
+		"authorization":         "Bearer public",
+		"user-agent":            ClientUA,
+		"x-opencode-client":     "cli",
+		"x-opencode-session":    session,
+		"x-opencode-session-id": session,
+		"x-session-affinity":    session,
+		"x-session-id":          session,
+		"x-opencode-project":    "global",
+		"accept":                accept,
 	}
+}
+
+// marshalNoEscape encodes v without HTML-escaping '<', '>' and '&'. Go's
+// encoding/json escapes them as \u003c/\u003e/\u0026 by default; Bun's
+// JSON.stringify — what the real CLI speaks — never does, and the gate reads
+// the difference (the fingerprint tools' descriptions contain "<line>").
+func marshalNoEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+}
+
+// chatKeyOrder is the v2 CLI's top-level serialization order for chat bodies;
+// Go maps would otherwise marshal alphabetically, which the gate reads as a
+// different client.
+var chatKeyOrder = []string{"model", "messages", "tools", "stream", "stream_options", "max_completion_tokens"}
+
+// MarshalUpstreamBody encodes one free-lane request body: no HTML escaping,
+// and the v2 client's top-level key order on chat payloads.
+func MarshalUpstreamBody(body map[string]any) ([]byte, error) {
+	if _, isChat := body["messages"]; !isChat {
+		return marshalNoEscape(body)
+	}
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	first := true
+	writeKV := func(k string) error {
+		v, ok := body[k]
+		if !ok {
+			return nil
+		}
+		kb, err := marshalNoEscape(k)
+		if err != nil {
+			return err
+		}
+		vb, err := marshalNoEscape(v)
+		if err != nil {
+			return err
+		}
+		if !first {
+			buf.WriteByte(',')
+		}
+		first = false
+		buf.Write(kb)
+		buf.WriteByte(':')
+		buf.Write(vb)
+		return nil
+	}
+	for _, k := range chatKeyOrder {
+		if err := writeKV(k); err != nil {
+			return nil, err
+		}
+	}
+	for _, k := range sortedKeys(body) {
+		known := false
+		for _, o := range chatKeyOrder {
+			if o == k {
+				known = true
+				break
+			}
+		}
+		if !known {
+			if err := writeKV(k); err != nil {
+				return nil, err
+			}
+		}
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
+
+func sortedKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // toolNameOf reads a tool's declared name from either tool shape.
@@ -235,11 +437,13 @@ func functionOf(tool map[string]any) map[string]any {
 	return fn
 }
 
-func quartetKey(name string) string {
-	lower := strings.ToLower(strings.TrimSpace(name))
+// fingerprintKey returns the fingerprint name when `name` is exactly one;
+// "" otherwise (case variants such as Claude's `Read` are not fingerprint names).
+func fingerprintKey(name string) string {
+	trimmed := strings.TrimSpace(name)
 	for _, t := range FingerprintTools {
-		if t == lower {
-			return lower
+		if t == trimmed {
+			return trimmed
 		}
 	}
 	return ""
@@ -262,125 +466,274 @@ func toolsOf(body map[string]any) []map[string]any {
 	return out
 }
 
-// ApplyFingerprint satisfies the free-tier gate on body.tools: all four
-// lowercase quartet names must be declared. A slot the caller already fields
-// is canonicalised in place; one it does not field is filled by promoting a
-// real tool that can answer for it (pwsh → bash), and only a slot with nothing
-// to promote gets a self-disabling decoy. The returned map is
-// sent-spelling → caller-spelling, so responses can restore real names.
+// ApplyFingerprint satisfies the v2 free-tier gate on body.tools: OpenCode's
+// own `read` and `shell` must be declared with their exact descriptions and
+// parameter schemas. A caller tool that already uses one of those names with a
+// different definition travels under an alias (`read_client`); the returned map
+// is sent-spelling → caller-spelling so responses can restore real names.
+// Stub descriptions, renamed schemas and tool_choice "none" are answered with
+// 403 FreeTierError.
 //
 // body is mutated in place. style: "chat" | "flat" (Responses) | "claude".
 func ApplyFingerprint(body map[string]any, style string) map[string]string {
 	claude := style == "claude"
 	flat := style == "flat"
-	renameMap := map[string]string{}
 	tools := toolsOf(body)
-	hadClientTools := len(tools) > 0
+	renameMap := map[string]string{}
 
+	// Conceal conflicting caller tools off the fingerprint names so the exact
+	// definitions can be appended without a duplicate name.
+	taken := map[string]bool{}
+	for _, t := range tools {
+		if n := toolNameOf(t); n != "" {
+			taken[n] = true
+		}
+	}
 	seen := map[string]bool{}
-	out := make([]any, 0, len(tools)+4)
+	out := make([]any, 0, len(tools)+2)
 	for _, tool := range tools {
-		current := toolNameOf(tool)
-		key := quartetKey(current)
+		key := fingerprintKey(toolNameOf(tool))
 		if key == "" {
 			out = append(out, tool)
 			continue
 		}
+		// Duplicate declarations of one name are rejected upstream; keep the first.
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		if current != key {
-			renameMap[key] = current
-			if fn := functionOf(tool); fn != nil {
-				clone := map[string]any{"type": tool["type"], "function": cloneMap(fn)}
-				clone["function"].(map[string]any)["name"] = key
-				out = append(out, clone)
-			} else {
-				clone := cloneMap(tool)
-				clone["name"] = key
-				out = append(out, clone)
-			}
-		} else {
+		if isFingerprintDefinition(tool, key) {
 			out = append(out, tool)
+			continue
 		}
+		alias := key + "_client"
+		for i := 2; taken[alias]; i++ {
+			alias = fmt.Sprintf("%s_client%d", key, i)
+		}
+		taken[alias] = true
+		renameMap[alias] = toolNameOf(tool)
+		out = append(out, withToolName(tool, alias))
 	}
 
-	promoted := map[string]bool{}
+	// Append OpenCode's exact definitions for each fingerprint tool not already
+	// declared. Flat (Responses) tools carry strict:false like the CLI.
+	appended := []string{}
 	for _, name := range FingerprintTools {
-		if seen[name] {
+		// Check the tools array, not the conceal seen set: an aliased
+		// conflicting tool no longer carries the fingerprint name, so the
+		// exact definition must still be appended (9router behaviour).
+		present := false
+		for _, t := range out {
+			if tm, ok := t.(map[string]any); ok && fingerprintKey(toolNameOf(tm)) == name {
+				present = true
+				break
+			}
+		}
+		if present {
 			continue
 		}
-		donors := quartetDonors[name]
-		idx := -1
-		for i, t := range out {
-			tm, ok := t.(map[string]any)
-			if !ok {
-				continue
-			}
-			orig := toolNameOf(tm)
-			if orig == "" || quartetKey(orig) != "" {
-				continue
-			}
-			lower := strings.ToLower(orig)
-			if promoted[lower] || !contains(donors, lower) {
-				continue
-			}
-			idx = i
-			break
-		}
-		if idx == -1 {
-			continue
-		}
-		tool := out[idx].(map[string]any)
-		orig := toolNameOf(tool)
-		promoted[strings.ToLower(orig)] = true
-		renameMap[name] = orig
-		if fn := functionOf(tool); fn != nil {
-			clone := map[string]any{"type": tool["type"], "function": cloneMap(fn)}
-			clone["function"].(map[string]any)["name"] = name
-			out[idx] = clone
-		} else {
-			clone := cloneMap(tool)
-			clone["name"] = name
-			out[idx] = clone
-		}
-		seen[name] = true
-	}
-
-	for _, name := range FingerprintTools {
-		if seen[name] {
-			continue
-		}
-		desc := "This tool is currently unavailable and must not be used."
+		desc, params, _ := fingerprintDefs(name)
 		switch {
 		case claude:
 			out = append(out, map[string]any{"name": name, "description": desc,
-				"input_schema": map[string]any{"type": "object", "properties": map[string]any{}}})
+				"input_schema": params})
 		case flat:
 			out = append(out, map[string]any{"type": "function", "name": name, "description": desc,
-				"parameters": map[string]any{"type": "object", "properties": map[string]any{}}})
+				"parameters": params, "strict": false})
 		default:
 			out = append(out, map[string]any{"type": "function",
 				"function": map[string]any{"name": name, "description": desc,
-					"parameters": map[string]any{"type": "object", "properties": map[string]any{}}}})
+					"parameters": params, "strict": false}})
 		}
+		seen[name] = true
+		appended = append(appended, name)
 	}
-
-	body["tools"] = out
-	if _, has := body["tool_choice"]; !has {
-		switch {
-		case flat:
-			body["tool_choice"] = "auto"
-		case !hadClientTools:
-			if claude {
-				body["tool_choice"] = map[string]any{"type": "none"}
-			} else {
-				body["tool_choice"] = "none"
+	// The 2.x CLI marks every chat function tool strict:false — caller tools
+	// included, so the serialized body matches byte for byte — and defaults
+	// the completion ceiling to 32000 when the caller named no limit. Both
+	// facts were confirmed live on 2026-10-23: a request missing either drew
+	// 403 FreeTierError while the same request with them passed the gate.
+	if !claude && !flat {
+		for _, item := range out {
+			if tm, ok := item.(map[string]any); ok {
+				if fn, ok := tm["function"].(map[string]any); ok {
+					if _, has := fn["strict"]; !has {
+						fn["strict"] = false
+					}
+				}
+			}
+		}
+		if _, hasMax := body["max_tokens"]; !hasMax {
+			if _, hasComp := body["max_completion_tokens"]; !hasComp {
+				body["max_completion_tokens"] = 32000
 			}
 		}
 	}
+	body["tools"] = out
+
+	retargetToolChoice(body, renameMap)
+	aliasHistoryToolCalls(body, renameMap)
+	if len(appended) > 0 {
+		noteUnavailableTools(body, flat, appended)
+	}
+
+	// Responses keeps its explicit auto default. Never default to "none":
+	// upstream answers tool_choice "none" with 403 FreeTierError.
+	if _, has := body["tool_choice"]; !has && flat {
+		body["tool_choice"] = "auto"
+	}
 	return renameMap
+}
+
+// isFingerprintDefinition reports whether `tool` already carries OpenCode's
+// exact definition for `key` (compared by description and JSON of parameters).
+func isFingerprintDefinition(tool map[string]any, key string) bool {
+	def := tool
+	if fn := functionOf(tool); fn != nil {
+		def = fn
+	}
+	wantDesc, wantParams, ok := fingerprintDefs(key)
+	if !ok || def == nil {
+		return false
+	}
+	if d, _ := def["description"].(string); d != wantDesc {
+		return false
+	}
+	got, _ := json.Marshal(def["parameters"])
+	want, _ := json.Marshal(wantParams)
+	return string(got) == string(want)
+}
+
+// withToolName clones `tool` with its name replaced, in either tool shape.
+func withToolName(tool map[string]any, name string) map[string]any {
+	if fn := functionOf(tool); fn != nil {
+		clone := map[string]any{"type": tool["type"], "function": cloneMap(fn)}
+		clone["function"].(map[string]any)["name"] = name
+		return clone
+	}
+	clone := cloneMap(tool)
+	clone["name"] = name
+	return clone
+}
+
+// retargetToolChoice points an explicit object tool_choice at the alias of a
+// concealed caller tool.
+func retargetToolChoice(body map[string]any, rename map[string]string) {
+	if len(rename) == 0 {
+		return
+	}
+	// Invert: original name -> alias.
+	aliases := map[string]string{}
+	for alias, orig := range rename {
+		aliases[orig] = alias
+	}
+	switch choice := body["tool_choice"].(type) {
+	case map[string]any:
+		if n, ok := choice["name"].(string); ok {
+			if alias, hit := aliases[strings.TrimSpace(n)]; hit {
+				choice["name"] = alias
+			}
+			return
+		}
+		if fn, ok := choice["function"].(map[string]any); ok {
+			if n, ok := fn["name"].(string); ok {
+				if alias, hit := aliases[strings.TrimSpace(n)]; hit {
+					fn["name"] = alias
+				}
+			}
+		}
+	}
+}
+
+// aliasHistoryToolCalls renames prior-turn calls to concealed caller tools;
+// otherwise the model reads its own earlier calls as calls to OpenCode's tool
+// of the same name.
+func aliasHistoryToolCalls(body map[string]any, rename map[string]string) {
+	if len(rename) == 0 {
+		return
+	}
+	aliases := map[string]string{}
+	for alias, orig := range rename {
+		aliases[orig] = alias
+	}
+	if items, ok := body["input"].([]any); ok {
+		for i, it := range items {
+			m, ok := it.(map[string]any)
+			if !ok || m["type"] != "function_call" {
+				continue
+			}
+			if n, ok := m["name"].(string); ok {
+				if alias, hit := aliases[n]; hit {
+					m["name"] = alias
+					_ = i
+				}
+			}
+		}
+	}
+	msgs, ok := body["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, mm := range msgs {
+		msg, ok := mm.(map[string]any)
+		if !ok {
+			continue
+		}
+		calls, ok := msg["tool_calls"].([]any)
+		if !ok {
+			continue
+		}
+		for _, cc := range calls {
+			call, ok := cc.(map[string]any)
+			if !ok {
+				continue
+			}
+			fn, ok := call["function"].(map[string]any)
+			if !ok {
+				continue
+			}
+			if n, ok := fn["name"].(string); ok {
+				if alias, hit := aliases[n]; hit {
+					fn["name"] = alias
+				}
+			}
+		}
+	}
+}
+
+// noteUnavailableTools tells the model the appended fingerprint tools are
+// placeholders: without the old "must not be used" descriptions the model
+// calls them, and "not available" made it refuse the caller's own Read/Bash
+// too. Upstream does not gate on the prompt text.
+func noteUnavailableTools(body map[string]any, flat bool, names []string) {
+	quoted := make([]string, len(names))
+	for i, n := range names {
+		quoted[i] = "`" + n + "`"
+	}
+	note := "Do not call the " + strings.Join(quoted, " or ") +
+		" tools; they are placeholders that do nothing. Use the other tools you have been given instead."
+	if flat {
+		if s, ok := body["instructions"].(string); ok && strings.TrimSpace(s) != "" {
+			body["instructions"] = s + "\n\n" + note
+		} else {
+			body["instructions"] = note
+		}
+		return
+	}
+	// OpenAI chat shape only; Claude-shaped bodies carry `system` instead.
+	msgs, ok := body["messages"].([]any)
+	if !ok || body["system"] != nil || len(msgs) == 0 {
+		return
+	}
+	if first, ok := msgs[0].(map[string]any); ok && first["role"] == "system" {
+		if c, ok := first["content"].(string); ok {
+			clone := cloneMap(first)
+			clone["content"] = c + "\n\n" + note
+			body["messages"] = append([]any{clone}, msgs[1:]...)
+			return
+		}
+	}
+	body["messages"] = append([]any{map[string]any{"role": "system", "content": note}}, msgs...)
 }
 
 // RestoreToolName maps a sent spelling back to the caller's.

@@ -1,12 +1,11 @@
 package subs
 
 import (
-	"archive/zip"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -39,8 +38,38 @@ type Manager struct {
 	stopping bool
 	rr       atomic.Uint64
 	lastSync time.Time
-	lastErr  string
-	version  string
+
+	// sticky remembers (conversation → exit) so one conversation keeps the
+	// same exit and a client's prompt cache has a chance to hit. It is a
+	// preference, never a lock: an unusable exit is dropped immediately.
+	sticky   map[string]string
+	stickyAt map[string]int64
+
+	// bans is the (exit, model) ledger: once an exit fails for a model, later
+	// requests stop re-hitting the same wall. fails/failAt drive the adaptive
+	// delay — a transient failure parks the pair for seconds, and only a
+	// repeated one grows it. There is deliberately no mirror table of
+	// "known-good" pairs: preferring one pins every concurrent request onto
+	// the first success (measured in #23), so the ledger only ever removes
+	// candidates.
+	bans   map[string]time.Time
+	fails  map[string]int
+	failAt map[string]time.Time
+	// nodeStreak counts consecutive dial failures per node, driving an
+	// escalating cooldown in coolNode so a persistently dead node stops costing
+	// a full dialTimeout on every request. Keyed by node ID.
+	nodeStreak map[string]int
+	// nodeFails counts consecutive **tunnel-level** failures seen by real
+	// traffic (ReportDead): the tunnel connects, the request dies mid-turn.
+	// Probes cannot see this state — a probe is one tiny round-trip — so two
+	// strikes inside failMemory retire the node until the periodic probe
+	// answers again.
+	nodeFails  map[string]int
+	nodeFailAt map[string]time.Time
+	lastErr    string
+	version    string
+
+	deathCancel context.CancelFunc // bounds the dead-node recheck loop
 }
 
 // NodeHealth is one node's live state for the rotation pool and the UI.
@@ -54,7 +83,11 @@ type NodeHealth struct {
 	Country   string `json:"country,omitempty"`
 	LatencyMs int    `json:"latencyMs,omitempty"`
 	LastCheck int64  `json:"lastCheck,omitempty"`
-	CoolUntil int64  `json:"-"`
+	// LastOKMs is when a **real request** last succeeded through this node,
+	// as opposed to when it was last probed. A probe is a sample and a served
+	// request is proof, so this is what clears a cooldown / a ban.
+	LastOKMs  int64 `json:"lastOkMs,omitempty"`
+	CoolUntil int64 `json:"-"`
 }
 
 // NewManager builds the manager; logging goes through log (may be nil).
@@ -62,18 +95,33 @@ func NewManager(st *store.Store, log func(string, ...any)) *Manager {
 	if log == nil {
 		log = func(string, ...any) {}
 	}
-	return &Manager{st: st, log: log, health: map[string]*NodeHealth{}}
+	return &Manager{
+		st: st, log: log,
+		health:   map[string]*NodeHealth{},
+		sticky:   map[string]string{},
+		bans:     map[string]time.Time{},
+		fails:    map[string]int{},
+		failAt:   map[string]time.Time{},
+		stickyAt: map[string]int64{},
+
+		nodeFails:  map[string]int{},
+		nodeFailAt: map[string]time.Time{},
+	}
 }
 
 // BinaryPath resolves the sing-box executable: the user-configured path wins,
-// then the auto-downloaded copy under <home>/bin/sing-box.exe.
+// then the auto-downloaded copy under <home>/bin/. The file name follows the
+// platform (only Windows carries .exe), so a macOS install manages itself
+// instead of reporting "not installed" over a name the runtime never creates
+// (issue #127).
 func (m *Manager) BinaryPath() string {
 	if p := strings.TrimSpace(m.st.Config().SingBoxPath); p != "" {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
 	}
-	p := filepath.Join(store.Home(), "bin", "sing-box.exe")
+	goos, _ := singBoxPlatform()
+	p := filepath.Join(store.Home(), "bin", singBoxExeName(goos))
 	if _, err := os.Stat(p); err == nil {
 		return p
 	}
@@ -107,16 +155,20 @@ func (m *Manager) Download(ctx context.Context) (string, error) {
 	if err := json.Unmarshal(data, &rel); err != nil {
 		return "", err
 	}
-	assetURL := ""
+	// Which asset this build wants is decided by its own platform; asking for
+	// windows-amd64.zip on macOS was the whole reason the install never worked
+	// there (issue #127).
+	goos, goarch := singBoxPlatform()
+	want := singBoxAssetSuffix(goos, goarch)
+	assetURL, assetName := "", ""
 	for _, a := range rel.Assets {
-		n := strings.ToLower(a.Name)
-		if strings.Contains(n, "windows-amd64") && strings.HasSuffix(n, ".zip") {
-			assetURL = a.URL
+		if strings.HasSuffix(strings.ToLower(a.Name), want) {
+			assetURL, assetName = a.URL, a.Name
 			break
 		}
 	}
 	if assetURL == "" {
-		return "", fmt.Errorf("发布 %s 中没有 windows-amd64.zip 资产", rel.TagName)
+		return "", fmt.Errorf("发布 %s 中没有 %s 资产", rel.TagName, want)
 	}
 	m.log("下载 sing-box %s …", rel.TagName)
 	req, err = http.NewRequestWithContext(ctx, http.MethodGet, assetURL, nil)
@@ -135,42 +187,16 @@ func (m *Manager) Download(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	zr, err := zip.NewReader(bytes.NewReader(zbuf), int64(len(zbuf)))
-	if err != nil {
-		return "", fmt.Errorf("解压 sing-box 失败: %w", err)
-	}
 	binDir := filepath.Join(store.Home(), "bin")
 	if err := os.MkdirAll(binDir, 0o700); err != nil {
 		return "", err
 	}
-	out := filepath.Join(binDir, "sing-box.exe")
-	for _, f := range zr.File {
-		base := strings.ToLower(filepath.Base(f.Name))
-		if base != "sing-box.exe" {
-			continue
-		}
-		src, err := f.Open()
-		if err != nil {
-			return "", err
-		}
-		dst, err := os.OpenFile(out+".tmp", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-		if err != nil {
-			src.Close()
-			return "", err
-		}
-		_, cerr := io.Copy(dst, src)
-		src.Close()
-		dst.Close()
-		if cerr != nil {
-			return "", cerr
-		}
-		if err := os.Rename(out+".tmp", out); err != nil {
-			return "", err
-		}
-		m.log("sing-box 已就绪: %s", out)
-		return out, nil
+	out := filepath.Join(binDir, singBoxExeName(goos))
+	if err := extractSingBoxBinary(zbuf, assetName, singBoxExeName(goos), out); err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("压缩包里没有 sing-box.exe")
+	m.log("sing-box 已就绪: %s", out)
+	return out, nil
 }
 
 // Refresh is the full cycle: fetch + parse every enabled subscription, write
@@ -209,7 +235,7 @@ func (m *Manager) Refresh(ctx context.Context) error {
 	if exe == "" {
 		return fmt.Errorf("没有 sing-box.exe——请在设置里填写路径或点「下载」")
 	}
-	if err := m.startProcess(exe, configPath); err != nil {
+	if err := m.startProcess(exe, configPath, len(nodes)); err != nil {
 		return err
 	}
 	m.mu.Lock()
@@ -224,8 +250,73 @@ func (m *Manager) Refresh(ctx context.Context) error {
 	if len(errs) > 0 {
 		m.log("部分订阅失败: %s", strings.Join(errs, "; "))
 	}
-	go m.ProbeAll(context.Background())
+	// Probing the moment startProcess returns kills the whole pool: sing-box
+	// has only just been exec'd, its inbounds are not listening yet, and one
+	// round of guaranteed-failure probes flips every node to Alive=false.
+	// Wait for the first socks port to accept before the health pass; the
+	// grace covers the remaining outbounds loading.
+	go func() {
+		waitPortReady(PortBase, portDialWait)
+		m.ProbeAll(context.Background())
+		m.startDeathLoop()
+	}()
 	return nil
+}
+
+// portDialWait bounds one port-readiness wait: 20 seconds covers sing-box's
+// cold start on slow disks; past that we probe anyway and let the death loop
+// recover false negatives.
+const portDialWait = 20 * time.Second
+
+// deathProbeInterval is how often a dead node gets another look. It exists
+// because ProbeAll's verdict is a sample: without this loop, nodes killed by
+// one unlucky round wait for the next full refresh (manual, or the hourly
+// one) while every client request fails on "没有健康节点".
+const deathProbeInterval = 2 * time.Minute
+
+// startDeathLoop re-probes dead nodes on a ticker for the process's life.
+// A repeat call replaces the previous loop instead of stacking. The loop
+// deliberately runs on its own context — binding it to a caller's timeout
+// (issue #29 defect 3) made it silently vanish while the pool stayed dead.
+func (m *Manager) startDeathLoop() {
+	m.mu.Lock()
+	if m.deathCancel != nil {
+		m.deathCancel()
+	}
+	pctx, pcancel := context.WithCancel(context.Background())
+	m.deathCancel = pcancel
+	m.mu.Unlock()
+	go func() {
+		t := time.NewTicker(deathProbeInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-pctx.Done():
+				return
+			case <-t.C:
+				m.ProbeDead(pctx)
+			}
+		}
+	}()
+}
+
+// waitPortReady blocks until sing-box's first socks inbound accepts a TCP
+// connection (inbounds bind in config order, so the base port going up means
+// the process finished booting), or until wait elapses.
+func waitPortReady(port int, wait time.Duration) {
+	deadline := time.Now().Add(wait)
+	for {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+		if err == nil {
+			conn.Close()
+			time.Sleep(2 * time.Second) // let the remaining outbounds bind
+			return
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
 }
 
 func displayName(s store.Subscription) string {
@@ -236,16 +327,24 @@ func displayName(s store.Subscription) string {
 }
 
 // startProcess (re)launches sing-box; the supervisor goroutine restarts it on
-// abnormal exit with capped backoff until Stop.
-func (m *Manager) startProcess(exe, configPath string) error {
+// abnormal exit with capped backoff until Stop. nodeCount is how many inbounds
+// the config binds — the restart guard has to cover all of them, so it is
+// passed in rather than read from a field the caller has not published yet.
+func (m *Manager) startProcess(exe, configPath string, nodeCount int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.stopping {
 		return fmt.Errorf("管理器已停止")
 	}
+	addrs := inboundPorts(nodeCount)
 	if m.cmd != nil {
-		_ = m.cmd.Process.Kill()
+		_ = stopAndWait(m.cmd.Process, addrs, restartWait)
 		m.cmd = nil
+	}
+	// A sidecar left by an earlier zen-gate owns these ports and nothing here
+	// can signal it. Starting anyway would bind-fail, exit, and restart forever.
+	if err := reapOrphan(addrs, restartWait); err != nil {
+		return err
 	}
 	if err := checkConfig(exe, configPath); err != nil {
 		return err
@@ -262,15 +361,30 @@ func (m *Manager) startProcess(exe, configPath string) error {
 		logf.Close()
 		return fmt.Errorf("启动 sing-box 失败: %w", err)
 	}
+	// The kill job is what makes an orphan impossible from now on; the pid file
+	// is how the next run recognises this one.
+	if err := tieToParent(cmd.Process); err != nil {
+		m.log("侧车没有并入回收作业: %v", err)
+	}
+	if err := writePidfileAt(cmd.Process.Pid, cmd.Path); err != nil {
+		m.log("写入 sing-box.pid 失败: %v", err)
+	}
 	if m.logFile != nil {
 		m.logFile.Close()
 	}
 	m.logFile, m.cmd = logf, cmd
 	m.version = queryVersion(exe)
-	m.log("sing-box %s 已启动 (pid %d, %d 节点)", m.version, cmd.Process.Pid, len(m.nodes))
+	// nodeCount, not len(m.nodes): Refresh publishes the node list only after
+	// this returns, and the boot log printed "0 节点" even with 77 nodes bound.
+	m.log("sing-box %s 已启动 (pid %d, %d 节点)", m.version, cmd.Process.Pid, nodeCount)
 	go m.supervise(cmd)
 	return nil
 }
+
+// restartWait bounds how long a restart waits for the old sidecar's sockets to
+// come back. sing-box closes its listeners immediately on terminate, so this
+// only has to cover the OS's own teardown.
+const restartWait = 3 * time.Second
 
 // checkConfig validates the generated config with `sing-box check` so a
 // schema mistake surfaces as a message instead of a crash-looping child.
@@ -319,11 +433,12 @@ func (m *Manager) supervise(cmd *exec.Cmd) {
 	time.Sleep(5 * time.Second)
 	m.mu.Lock()
 	exe, configPath := m.BinaryPath(), filepath.Join(store.SubsDir(), "sing-box.json")
+	nodeCount := len(m.nodes)
 	m.mu.Unlock()
 	if exe == "" {
 		return
 	}
-	_ = m.startProcess(exe, configPath)
+	_ = m.startProcess(exe, configPath, nodeCount)
 }
 
 // Stop kills the sidecar; called from every app shutdown path (the tray-quit
@@ -332,11 +447,17 @@ func (m *Manager) Stop() {
 	m.mu.Lock()
 	m.stopping = true
 	cmd := m.cmd
+	nodeCount := len(m.nodes)
 	m.cmd = nil
+	if m.deathCancel != nil {
+		m.deathCancel()
+		m.deathCancel = nil
+	}
 	m.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
+		_ = stopAndWait(cmd.Process, inboundPorts(nodeCount), restartWait)
 	}
+	_ = removePidfile()
 }
 
 // Apply toggles the feature on: enable in config, run a full refresh cycle.
@@ -357,15 +478,16 @@ func (m *Manager) SetPath(path string) error {
 		}
 	}
 	m.mu.Lock()
-	m.st.Config().SingBoxPath = path
+	m.st.Mutate(func(cfg *store.Config) { cfg.SingBoxPath = path })
 	_ = m.st.Save()
 	wasRunning := m.cmd != nil
+	nodeCount := len(m.nodes)
 	m.mu.Unlock()
 	if wasRunning {
 		configPath := filepath.Join(store.SubsDir(), "sing-box.json")
 		if _, err := os.Stat(configPath); err == nil {
 			if exe := m.BinaryPath(); exe != "" {
-				return m.startProcess(exe, configPath)
+				return m.startProcess(exe, configPath, nodeCount)
 			}
 		}
 	}
@@ -399,6 +521,11 @@ func (m *Manager) Status() map[string]any {
 		"portBase": PortBase,
 	}
 }
+
+// AsRotator exposes the manager to the gateway so a runtime switch to
+// 订阅轮询 installs a real dialer instead of installing the mode with no
+// rotator behind it (#121).
+func (m *Manager) AsRotator() lane.Rotator { return m }
 
 // Healthy implements lane.Rotator.
 func (m *Manager) Healthy() int {

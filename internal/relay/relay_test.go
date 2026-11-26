@@ -6,11 +6,91 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"zen-gate/internal/lane"
 	"zen-gate/internal/store"
 )
+
+// TestCompleteHeaderWatchdog: a user-added upstream that accepts the
+// connection and then never sends response headers (the observed NVIDIA NIM
+// free-queue shape: harness request hangs 20-44s until the client aborts) must
+// fail fast as TRANSPORT instead of hanging the agent. providerHeaderBound is
+// shrunk so the test does not wait 30 seconds.
+func TestCompleteHeaderWatchdog(t *testing.T) {
+	old := providerHeaderBound
+	providerHeaderBound = 300 * time.Millisecond
+	relayMu.Lock()
+	relayClient = nil // force a clone under the shrunk bound
+	relayMu.Unlock()
+	defer func() {
+		providerHeaderBound = old
+		relayMu.Lock()
+		relayClient = nil
+		relayMu.Unlock()
+	}()
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Second) // headers never arrive within the bound
+	}))
+	defer up.Close()
+	p := &store.Provider{ID: "pv", Name: "pv", BaseURL: up.URL + "/v1",
+		Protocol: store.ProtocolOpenAI, APIKey: "k"}
+	start := time.Now()
+	_, _, uerr := Complete(context.Background(), Turn{
+		Provider: p, Model: "m", Messages: []lane.Message{{Role: lane.RoleUser, Parts: []lane.Part{lane.TextPart{Text: "hi"}}}},
+	}, func(lane.Chunk) {})
+	if uerr == nil {
+		t.Fatal("want an error for a header-stalling upstream")
+	}
+	if uerr.Code != lane.CodeTransport {
+		t.Fatalf("code = %s, want %s", uerr.Code, lane.CodeTransport)
+	}
+	if dt := time.Since(start); dt > 2*time.Second {
+		t.Fatalf("took %v: watchdog did not cut the header wait", dt)
+	}
+}
+
+// TestCompleteStreamIdleWatchdog: headers + the first frame arrive, then the
+// stream goes silent forever. The pump must cut at providerStreamIdle rather
+// than ride the client's own patience — the answer already produced still
+// reaches the caller before the cut.
+func TestCompleteStreamIdleWatchdog(t *testing.T) {
+	old := providerStreamIdle
+	providerStreamIdle = 400 * time.Millisecond
+	defer func() { providerStreamIdle = old }()
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(200)
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hi"}}]}`)
+		fmt.Fprintln(w)
+		w.(http.Flusher).Flush()
+		time.Sleep(3 * time.Second) // silence after a live first byte
+	}))
+	defer up.Close()
+	p := &store.Provider{ID: "pv", Name: "pv", BaseURL: up.URL + "/v1",
+		Protocol: store.ProtocolOpenAI, APIKey: "k"}
+	var got string
+	start := time.Now()
+	_, _, uerr := Complete(context.Background(), Turn{
+		Provider: p, Model: "m", Messages: []lane.Message{{Role: lane.RoleUser, Parts: []lane.Part{lane.TextPart{Text: "hi"}}}},
+	}, func(c lane.Chunk) {
+		if c.Kind == lane.ChunkTextDelta {
+			got += c.Delta
+		}
+	})
+	if uerr == nil {
+		t.Fatal("want an error for a stalled stream")
+	}
+	if got == "" {
+		t.Fatal("the first frame should have reached the caller before the cut")
+	}
+	if dt := time.Since(start); dt > 2*time.Second {
+		t.Fatalf("took %v: idle pump did not cut the stalled stream", dt)
+	}
+}
 
 func TestFetchModelsOpenAI(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -52,6 +132,38 @@ func TestFetchModelsAnthropic(t *testing.T) {
 	}
 }
 
+func TestFetchModelCatalogKeepsDeclaredCapacities(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"object":"list","data":[
+			{"id":"nvidia/m1","max_input_tokens":131072,"max_output_tokens":4096},
+			{"id":"nvidia/m2"}]}`)
+	}))
+	defer up.Close()
+	rows, err := FetchModelCatalog(context.Background(), up.URL+"/v1", "sk-abc", "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %v", rows)
+	}
+	if rows[0].ContextWindow != 131072 || rows[0].MaxOutput != 4096 {
+		t.Errorf("declared capacities dropped: %+v", rows[0])
+	}
+	if rows[1].ID != "nvidia/m2" || rows[1].ContextWindow != 0 || rows[1].MaxOutput != 0 {
+		t.Errorf("a model without numbers must still come back, unnumbered: %+v", rows[1])
+	}
+}
+
+func TestFetchModelCatalogRejectsEmptyListing(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"object":"list","data":[]}`)
+	}))
+	defer up.Close()
+	if _, err := FetchModelCatalog(context.Background(), up.URL+"/v1", "sk-abc", "openai"); err == nil {
+		t.Fatal("an empty listing must error — it means the Base URL or Key is wrong")
+	}
+}
+
 func TestRecommendedModelsNVIDIA(t *testing.T) {
 	// Real NVIDIA NIM catalog subset (Oct 2026) incl. junk and small models.
 	cat := []string{
@@ -64,7 +176,7 @@ func TestRecommendedModelsNVIDIA(t *testing.T) {
 	}
 	rec := RecommendedModels("", "https://integrate.api.nvidia.com/v1", cat)
 	want := map[string]bool{
-		"deepseek-ai/deepseek-v4.1-flash": true,
+		"deepseek-ai/deepseek-v4.1-flash":   true,
 		"nvidia/nemotron-3-super-120b-a12b": true,
 		"nvidia/nemotron-3-ultra-550b-a55b": true,
 	}
@@ -142,6 +254,24 @@ func TestRecommendedModelsModelScope(t *testing.T) {
 	}
 }
 
+func TestRecommendedModelsIntern(t *testing.T) {
+	cat := []string{"Agents-A1", "Atria-Dawn", "Atria-Dawn-Preview",
+		"deepseek-v4-flash-0731", "deepseek-v4-flash-vision", "deepseek-v4-pro-0813",
+		"glm-5.3", "intern-s2", "kimi-k2.6", "minimax-m3", "qwen3.8-27b"}
+	rec := RecommendedModels("", "https://discovery-api.intern-ai.org.cn/v1", cat)
+	want := map[string]bool{"deepseek-v4-flash-0731": true, "deepseek-v4-flash-vision": true,
+		"deepseek-v4-pro-0813": true, "glm-5.3": true, "intern-s2": true,
+		"kimi-k2.6": true, "qwen3.8-27b": true, "minimax-m3": true}
+	if len(rec) != len(want) {
+		t.Fatalf("recommended = %v", rec)
+	}
+	for _, m := range rec {
+		if !want[m] {
+			t.Fatalf("unexpected recommendation %q (Atria/Agents opt-in only)", m)
+		}
+	}
+}
+
 func TestRecommendedModelsUnknownHeuristic(t *testing.T) {
 	cat := []string{"acme/embed-3b", "acme/safety-mini", "acme/llama2-70b",
 		"acme/something-70b-instruct", "acme/tiny-7b"}
@@ -207,6 +337,52 @@ func TestProbeModelVerdicts(t *testing.T) {
 	}
 }
 
+// Some OpenAI-compatible gateways ignore "stream": true and answer with one
+// plain JSON object. The probe must read that as a successful answer instead
+// of "上游流在数据帧之前结束" for a model that is perfectly usable.
+func TestProbeModelPlainJSONAnswer(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		fmt.Fprint(w, `{"id":"x","choices":[{"message":{"role":"assistant","content":"pong"}}]}`)
+	}))
+	defer up.Close()
+	p := &store.Provider{ID: "t", BaseURL: up.URL, APIKey: "sk", Protocol: store.ProtocolOpenAI}
+	r := ProbeModel(context.Background(), p, "m1")
+	if r.State != lane.StateAvailable || r.TTFTMs <= 0 {
+		t.Fatalf("non-SSE probe = %+v", r)
+	}
+}
+
+// A 2xx body carrying a JSON error object (no "data:" frame) must classify
+// through the upstream error, not silently report a dead model or hang.
+func TestProbeModelNonStreamedJSONError(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		fmt.Fprint(w, `{"error":{"message":"rate limit exceeded"}}`)
+	}))
+	defer up.Close()
+	p := &store.Provider{ID: "t", BaseURL: up.URL, APIKey: "sk", Protocol: store.ProtocolOpenAI}
+	r := ProbeModel(context.Background(), p, "m1")
+	if r.State != lane.StateThrottled {
+		t.Fatalf("non-SSE JSON error probe = %+v", r)
+	}
+}
+
+// A front-proxy HTML page at 200 with no data frame is still judged (the
+// classifier names the hop) rather than left as "ended before a data frame".
+func TestProbeModelNonStreamedHTMLPage(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/html")
+		fmt.Fprint(w, `<html><body>502 Bad Gateway</body></html>`)
+	}))
+	defer up.Close()
+	p := &store.Provider{ID: "t", BaseURL: up.URL, APIKey: "sk", Protocol: store.ProtocolOpenAI}
+	r := ProbeModel(context.Background(), p, "m1")
+	if r.State != lane.StateUnknown {
+		t.Fatalf("non-SSE HTML probe = %+v", r)
+	}
+}
+
 func TestCompleteOpenAIWire(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
@@ -249,5 +425,60 @@ func TestCompleteOpenAIWire(t *testing.T) {
 	}
 	if usage.Input != 9 || usage.Output != 1 {
 		t.Fatalf("usage = %+v", usage)
+	}
+}
+
+// Issue #55: an opencode.ai endpoint (the paid Go tier) rejects a session-less
+// turn with 400 MissingSessionID, so a relayed turn must carry
+// x-opencode-session — minted in the shape #47 established and stable across
+// the conversation's turns. Every other host must NOT receive the header.
+func TestCompleteSendsOpenCodeSessionOnlyToOpenCode(t *testing.T) {
+	var gotSession atomic.Value
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSession.Store(r.Header.Get("x-opencode-session"))
+		w.Header().Set("content-type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"ok"}}]}`)
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`)
+		fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer up.Close()
+
+	msgs := []lane.Message{{Role: lane.RoleUser, Parts: []lane.Part{lane.TextPart{Text: "hi"}}}}
+	// The provider points at the test server, but isOpenCodeHost keys on the
+	// host string; exercise the header writer directly for the opencode case
+	// and the end-to-end path for the negative case.
+	plain := &store.Provider{ID: "p", BaseURL: up.URL, APIKey: "sk", Protocol: store.ProtocolOpenAI, Enabled: true}
+	if _, _, uerr := Complete(context.Background(), Turn{Provider: plain, Model: "m", Messages: msgs, MaxTokens: 8}, func(lane.Chunk) {}); uerr != nil {
+		t.Fatalf("plain relay: %v", uerr)
+	}
+	if s, _ := gotSession.Load().(string); s != "" {
+		t.Fatalf("non-opencode host got session %q, want none", s)
+	}
+
+	h := http.Header{}
+	identityHeaders(h, plain, "ses_abcdef012345ABCDEFGHIJKLMN")
+	if h.Get("x-opencode-session") != "" {
+		t.Fatalf("identityHeaders must not touch a non-opencode provider")
+	}
+	goProv := &store.Provider{ID: "go", BaseURL: "https://opencode.ai/inference/go/v1", Protocol: store.ProtocolOpenAI}
+	identityHeaders(h, goProv, "ses_abcdef012345ABCDEFGHIJKLMN")
+	if h.Get("x-opencode-session") != "ses_abcdef012345ABCDEFGHIJKLMN" {
+		t.Fatalf("opencode host must get the session header, got %q", h.Get("x-opencode-session"))
+	}
+	if !isOpenCodeHost("https://opencode.ai/inference/go/v1") || isOpenCodeHost(up.URL) {
+		t.Fatal("isOpenCodeHost must accept opencode.ai and reject other hosts")
+	}
+
+	// Same conversation → same minted session; a different one differs.
+	a := relaySession("claude", msgs)
+	if b := relaySession("claude", msgs); a != b {
+		t.Fatalf("one conversation must map to one session: %s != %s", a, b)
+	}
+	if !regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`).MatchString(a) {
+		t.Fatalf("session %q is not in the minted shape the gate decodes", a)
+	}
+	other := relaySession("claude", []lane.Message{{Role: lane.RoleUser, Parts: []lane.Part{lane.TextPart{Text: "different"}}}})
+	if other == a {
+		t.Fatal("different conversations must differ")
 	}
 }

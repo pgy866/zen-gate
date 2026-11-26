@@ -37,8 +37,10 @@ func assetName() string {
 }
 
 // FeedURL is the default update feed, overridable via -ldflags at release
-// build time and per-install through settings.
-var FeedURL = ""
+// build time and per-install through settings. It points at this repository's
+// own Releases API — leaving it empty made every build's update check answer
+// "already latest" without ever looking anywhere.
+var FeedURL = "https://api.github.com/repos/LAGcomcom/zen-gate/releases/latest"
 
 // Current is the running version, overridable via -ldflags.
 var Current = "1.1.0"
@@ -130,7 +132,9 @@ func LatestAssetURL(data []byte) (string, int64, error) {
 	return "", 0, fmt.Errorf("release %s has no %s asset", rel.TagName, want)
 }
 
-type getJSONer interface{ Get(url string) ([]byte, error) }
+type getJSONer interface {
+	Get(url string) ([]byte, error)
+}
 
 // Newer compares dotted versions; "1.2.10" > "1.2.9".
 func Newer(remote, current string) bool {
@@ -168,18 +172,38 @@ type HTTP struct {
 	Client  *http.Client
 }
 
+// Get fetches the feed. When the primary route answers 403 or 429 — a shared
+// proxy exit exhausting GitHub's unauthenticated rate limit is the usual
+// cause, and it flaps as the exit rotates — the fetch retries once with a
+// no-proxy client, since api.github.com is reachable directly from networks
+// where github.com itself is not.
 func (h HTTP) Get(url string) ([]byte, error) {
-	timeout := h.Timeout
-	if timeout <= 0 {
-		timeout = 15 * time.Second
+	data, err := h.fetch(url, h.Client)
+	if err != nil && isRateLimited(err) {
+		var fallback *http.Client
+		if h.Client != nil {
+			fallback = &http.Client{Timeout: h.timeout(), Transport: &http.Transport{Proxy: nil}}
+		}
+		return h.fetch(url, fallback)
 	}
+	return data, err
+}
+
+func (h HTTP) timeout() time.Duration {
+	if h.Timeout <= 0 {
+		return 15 * time.Second
+	}
+	return h.Timeout
+}
+
+// fetch runs one GET and turns non-2xx statuses into a statusError.
+func (h HTTP) fetch(url string, client *http.Client) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	client := h.Client
 	if client == nil {
-		client = &http.Client{Timeout: timeout}
+		client = &http.Client{Timeout: h.timeout()}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -187,7 +211,18 @@ func (h HTTP) Get(url string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("update feed returned HTTP %d", resp.StatusCode)
+		return nil, &statusError{Code: resp.StatusCode}
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+}
+
+// statusError carries the feed's HTTP status so the fallback can tell a rate
+// limit or WAF refusal from a transport fault.
+type statusError struct{ Code int }
+
+func (e *statusError) Error() string { return fmt.Sprintf("update feed returned HTTP %d", e.Code) }
+
+func isRateLimited(err error) bool {
+	se, ok := err.(*statusError)
+	return ok && (se.Code == 403 || se.Code == 429)
 }

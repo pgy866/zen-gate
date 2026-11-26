@@ -2,6 +2,8 @@ package lane
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --- identity minting -------------------------------------------------------
@@ -16,9 +19,50 @@ import (
 func TestMintSessionIdShape(t *testing.T) {
 	re := regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
 	for i := 0; i < 50; i++ {
-		id := MintSessionId(1790925320157)
+		id := MintSessionId(0)
 		if !re.MatchString(id) {
 			t.Fatalf("minted session id does not match gateway shape: %s", id)
+		}
+	}
+}
+
+// The free-tier gate decodes the 12-hex prefix back to a timestamp and 403s
+// any session whose prefix is not mint-shaped and fresh (#47). The mint
+// keeps the LOW 48 bits of ~(ms<<12|seq), so decoding recovers only the low
+// 36 bits of the minted millisecond stamp — which is exactly what the gate
+// can check against wall clock.
+func decodePrefixMsBits(id string) (uint64, bool) {
+	raw, err := hex.DecodeString(strings.TrimPrefix(id, "ses_")[:12])
+	if err != nil {
+		return 0, false
+	}
+	var v uint64
+	for _, b := range raw {
+		v = v<<8 | uint64(b)
+	}
+	return (^v & 0xFFFFFFFFFFFF) >> 12, true
+}
+
+func TestConversationSessionPrefixDecodesToFreshTimestamp(t *testing.T) {
+	for _, seed := range []string{"conv-1", "conv-2"} {
+		id := SessionForConversation(seed)
+		got, ok := decodePrefixMsBits(id)
+		if !ok {
+			t.Fatalf("prefix of %s is not decodable hex", id)
+		}
+		now := uint64(time.Now().UnixMilli()) & 0xFFFFFFFFF
+		if diff := int64(now) - int64(got); diff < -60_000 || diff > 60_000 {
+			t.Fatalf("prefix of %s decodes to %d, now-bits %d — the gate wants a fresh mint", id, got, now)
+		}
+	}
+	// A digest-shaped id (old behaviour) decodes to a nonsense stamp —
+	// exactly why the gate rejected it. This pins the contrast.
+	sum := sha256.Sum256([]byte("zen-gate\x00old-style"))
+	old := "ses_" + hex.EncodeToString(sum[:6]) + base62From(sum[6:20])
+	if got, ok := decodePrefixMsBits(old); ok {
+		now := uint64(time.Now().UnixMilli()) & 0xFFFFFFFFF
+		if diff := int64(now) - int64(got); diff > -60_000 && diff < 60_000 {
+			t.Fatalf("digest-style id %s decodes fresh (%d) — test lost its meaning", old, got)
 		}
 	}
 }
@@ -50,60 +94,83 @@ func TestRequestIdForStablePerTurn(t *testing.T) {
 
 // --- fingerprint gate -------------------------------------------------------
 
-func TestApplyFingerprintPromotesRealShell(t *testing.T) {
+func TestApplyFingerprintAliasesConflictingRead(t *testing.T) {
 	body := map[string]any{"tools": []any{
 		map[string]any{"type": "function", "function": map[string]any{
-			"name": "pwsh", "description": "run shell", "parameters": map[string]any{"type": "object"},
+			"name": "read", "description": "custom reader", "parameters": map[string]any{"type": "object"},
 		}},
 	}}
 	rename := ApplyFingerprint(body, "chat")
 	tools := body["tools"].([]any)
-	if len(tools) != 4 {
-		t.Fatalf("quartet must be complete, got %d", len(tools))
+	if len(tools) != 3 {
+		t.Fatalf("conflicting read + exact read + shell, got %d tools", len(tools))
 	}
-	if rename["bash"] != "pwsh" {
-		t.Fatalf("bash slot must be donated by pwsh, rename=%v", rename)
+	if rename["read_client"] != "read" {
+		t.Fatalf("conflicting read must travel as read_client, rename=%v", rename)
 	}
-	// The promoted tool carries the bash name on the wire.
-	first := tools[0].(map[string]any)["function"].(map[string]any)["name"]
-	if first != "bash" {
-		t.Fatalf("promoted slot must be sent as bash, got %v", first)
-	}
-	// Remaining slots get self-disabling decoys.
-	for _, tt := range tools[1:] {
-		m := tt.(map[string]any)["function"].(map[string]any)
-		if m["description"] != "This tool is currently unavailable and must not be used." {
-			t.Fatalf("missing slot must get a decoy, got %v", m)
-		}
-	}
-}
-
-func TestApplyFingerprintNoDuplicates(t *testing.T) {
-	body := map[string]any{"tools": []any{
-		map[string]any{"type": "function", "function": map[string]any{"name": "Bash", "parameters": map[string]any{}}},
-		map[string]any{"type": "function", "function": map[string]any{"name": "bash", "parameters": map[string]any{}}},
-	}}
-	ApplyFingerprint(body, "chat")
-	tools := body["tools"].([]any)
-	count := 0
+	names := map[string]string{}
 	for _, tt := range tools {
-		m := tt.(map[string]any)
-		if fn := m["function"].(map[string]any)["name"]; fn == "bash" {
-			count++
-		}
+		m := tt.(map[string]any)["function"].(map[string]any)
+		names[m["name"].(string)] = m["description"].(string)
 	}
-	if count != 1 {
-		t.Fatalf("case variants must canonicalise to one bash, got %d", count)
+	if names["read_client"] != "custom reader" {
+		t.Fatalf("aliased tool must keep the caller definition, got %q", names["read_client"])
+	}
+	if !strings.Contains(names["read"], "Read the contents of a file") {
+		t.Fatalf("exact read must be appended, got %q", names["read"])
+	}
+	if !strings.Contains(names["shell"], "Execute a shell command") {
+		t.Fatalf("exact shell must be appended, got %q", names["shell"])
 	}
 }
 
-func TestApplyFingerprintRealBashUntouched(t *testing.T) {
+func TestApplyFingerprintExactDefinitionKept(t *testing.T) {
+	_, params, _ := fingerprintDefs("read")
 	body := map[string]any{"tools": []any{
-		map[string]any{"type": "function", "function": map[string]any{"name": "bash", "parameters": map[string]any{}}},
+		map[string]any{"type": "function", "function": map[string]any{
+			"name": "read", "description": realReadDesc, "parameters": params,
+		}},
 	}}
 	rename := ApplyFingerprint(body, "chat")
 	if len(rename) != 0 {
-		t.Fatalf("a real bash needs no rename, got %v", rename)
+		t.Fatalf("an exact fingerprint definition needs no rename, got %v", rename)
+	}
+	tools := body["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("exact read kept + shell appended, got %d tools", len(tools))
+	}
+}
+
+func TestApplyFingerprintCaseVariantsPassThrough(t *testing.T) {
+	body := map[string]any{"tools": []any{
+		map[string]any{"type": "function", "function": map[string]any{"name": "Read", "parameters": map[string]any{"type": "object"}}},
+		map[string]any{"type": "function", "function": map[string]any{"name": "Bash", "parameters": map[string]any{"type": "object"}}},
+	}}
+	rename := ApplyFingerprint(body, "chat")
+	if len(rename) != 0 {
+		t.Fatalf("case variants are not fingerprint names, rename=%v", rename)
+	}
+	tools := body["tools"].([]any)
+	if len(tools) != 4 {
+		t.Fatalf("caller tools + read + shell, got %d tools", len(tools))
+	}
+	// Caller tools are preserved verbatim.
+	first := tools[0].(map[string]any)["function"].(map[string]any)["name"]
+	if first != "Read" {
+		t.Fatalf("case variants must pass through untouched, got %v", first)
+	}
+}
+
+func TestApplyFingerprintNoToolChoiceNone(t *testing.T) {
+	body := map[string]any{}
+	ApplyFingerprint(body, "chat")
+	if _, has := body["tool_choice"]; has {
+		t.Fatalf("chat must not default tool_choice, got %v", body["tool_choice"])
+	}
+	body = map[string]any{}
+	ApplyFingerprint(body, "flat")
+	if body["tool_choice"] != "auto" {
+		t.Fatalf("flat defaults to auto, got %v", body["tool_choice"])
 	}
 }
 
@@ -150,12 +217,12 @@ func TestRepairToolPairingKeepsPaired(t *testing.T) {
 
 func TestSniffBodyByShapeNotHeader(t *testing.T) {
 	cases := map[string]string{
-		"data: {\"a\":1}\n\n":            "sse",
-		"event: message\ndata: {}\n\n":   "sse",
-		"{\"choices\": []}":              "json",
-		"":                               "empty",
-		"   \r\n":                        "empty",
-		"<html>hello</html>":             "unknown",
+		"data: {\"a\":1}\n\n":          "sse",
+		"event: message\ndata: {}\n\n": "sse",
+		"{\"choices\": []}":            "json",
+		"":                             "empty",
+		"   \r\n":                      "empty",
+		"<html>hello</html>":           "unknown",
 	}
 	for body, want := range cases {
 		if got := sniffBody([]byte(body)); got != want {
@@ -418,9 +485,47 @@ func TestBudgetForAlwaysThinkingDoubled(t *testing.T) {
 	if got := BudgetFor("light", m2, 0, 0); got != 2048 {
 		t.Fatalf("light on normal model must be 2048, got %d", got)
 	}
-	// A zero/negative requested ceiling is *no* ceiling, not zero.
-	if got := BudgetFor("deep", m2, 0, 0); got != 131072 {
-		t.Fatalf("deep must inherit capacity, got %d", got)
+	// A zero/negative requested ceiling is *no* ceiling, not zero. Deep takes
+	// the model's measured capacity widened by the headroom factor: a probe
+	// reads a floor (it stops at the first size it did not try), so the raw
+	// table value must not become a hard cap.
+	if got := BudgetFor("deep", m2, 0, 0); got != 131072*3/2 {
+		t.Fatalf("deep must inherit capacity with headroom, got %d", got)
+	}
+}
+
+// TestBudgetForExplicitRequestWins pins the issue #27 semantics: a client that
+// states max_tokens outright is not silently clamped to the local guess table
+// (the old code capped a 128K request at the 32768 fallback and the user's
+// setting looked inert). An explicit request may exceed m.MaxOutput — the
+// upstream is the authority on rejection — while the ladder rungs below deep
+// keep controlling, and with no explicit request defaultMaxTokens still caps
+// from above ("只压低不抬高", #23).
+func TestBudgetForExplicitRequestWins(t *testing.T) {
+	guessed := ModelInfo{MaxOutput: 32768, Reasoning: true, CanDisableThinking: true}
+	if got := BudgetFor("deep", guessed, 128000, 32768); got != 128000 {
+		t.Fatalf("explicit 128K must survive a 32K guessed table, got %d", got)
+	}
+	// light/balanced rungs still cap below an oversized explicit request.
+	if got := BudgetFor("balanced", guessed, 128000, 32768); got != 8192 {
+		t.Fatalf("balanced must stay 8192 despite the request, got %d", got)
+	}
+	// No explicit request: a KNOWN capacity speaks for itself. The configured
+	// fallback used to cap it from above, which made a model measured at 256K
+	// answer with 32K whenever the client stated nothing — the user sees a
+	// model that "hits the output limit immediately".
+	table := ModelInfo{MaxOutput: 131072, Reasoning: true, CanDisableThinking: true}
+	if got := BudgetFor("deep", table, 0, 32768); got != 131072*3/2 {
+		t.Fatalf("known capacity must not be capped by the fallback, got %d", got)
+	}
+	// Unknown capacity: the fallback is what keeps it sane.
+	unknown := ModelInfo{Reasoning: true, CanDisableThinking: true}
+	if got := BudgetFor("deep", unknown, 0, 32768); got != 32768 {
+		t.Fatalf("unknown capacity must be bounded by the fallback, got %d", got)
+	}
+	// Unknown table (MaxOutput 0) + no request: conservative default stands.
+	if got := BudgetFor("deep", ModelInfo{Reasoning: true}, 0, 0); got != defaultUnknownCapacity {
+		t.Fatalf("unknown capacity must inherit the default, got %d", got)
 	}
 }
 
@@ -478,5 +583,212 @@ func TestToClaudeMessagesToolResultLeads(t *testing.T) {
 	third := out[2]["content"].([]map[string]any)
 	if third[0]["type"] != "tool_result" {
 		t.Fatalf("tool_result must lead the user turn, got %v", third[0]["type"])
+	}
+}
+
+// --- reasoning spellings -----------------------------------------------------
+
+func TestDecoderChatReasoningSpellings(t *testing.T) {
+	var reasons []string
+	for _, spelling := range []string{"reasoning", "reasoning_content", "reasoning_text", "thinking"} {
+		reasons = nil
+		dec := NewDecoder("chat", nil, func(c Chunk) {
+			if c.Kind == ChunkReasonDelta {
+				reasons = append(reasons, c.Delta)
+			}
+		})
+		dec.Decode([]byte(`{"choices":[{"delta":{` + `"` + spelling + `":"deep thought"}}]}`))
+		if strings.Join(reasons, "") != "deep thought" {
+			t.Fatalf("spelling %q not read as reasoning", spelling)
+		}
+	}
+	// reasoning_details array form, and only the first non-empty spelling
+	// counting when a frame carries two names for the same text.
+	reasons = nil
+	dec := NewDecoder("chat", nil, func(c Chunk) {
+		if c.Kind == ChunkReasonDelta {
+			reasons = append(reasons, c.Delta)
+		}
+	})
+	dec.Decode([]byte(`{"choices":[{"delta":{"reasoning_details":[{"text":"part "},{"text":"two"}]}}]}`))
+	if strings.Join(reasons, "") != "part two" {
+		t.Fatalf("reasoning_details not read: %v", reasons)
+	}
+	reasons = nil
+	dec.Decode([]byte(`{"choices":[{"delta":{"reasoning_content":"a","reasoning":"b"}}]}`))
+	// "reasoning" heads the priority order, so the duplicated frame reads once.
+	if strings.Join(reasons, "") != "b" {
+		t.Fatalf("duplicated spelling must not double the block: %v", reasons)
+	}
+}
+
+// --- nameless tool calls -----------------------------------------------------
+
+func TestDecoderChatNamelessToolCallBroken(t *testing.T) {
+	dec := NewDecoder("chat", nil, func(Chunk) {})
+	dec.Decode([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"arguments":"{}"}}]}}]}`))
+	dec.Decode([]byte(`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`))
+	res := dec.Finish()
+	if !res.BrokenToolCall || res.Finish != FinishMaxTokens {
+		t.Fatalf("a call that never learned its name must break the turn: %+v", res)
+	}
+}
+
+func TestRepairToolPairingDropsNamelessAnsweredCall(t *testing.T) {
+	msgs := []Message{
+		{Role: RoleUser, Parts: []Part{TextPart{"q"}}},
+		{Role: RoleAssistant, Parts: []Part{ToolCallPart{ID: "c1", Name: "", Arguments: "{}"}}},
+		{Role: RoleTool, Parts: []Part{ToolResultPart{ToolCallID: "c1", Text: "Error: unknown tool \"\""}}},
+	}
+	out := RepairToolPairing(msgs)
+	if len(out) != 2 {
+		t.Fatalf("nameless call and its result must both go: %+v", out)
+	}
+	for _, m := range out {
+		for _, p := range m.Parts {
+			switch p.(type) {
+			case ToolCallPart, ToolResultPart:
+				t.Fatalf("call/result husk survived the repair: %+v", out)
+			}
+		}
+	}
+	// A named, answered call is untouched.
+	paired := []Message{
+		{Role: RoleAssistant, Parts: []Part{ToolCallPart{ID: "c2", Name: "bash", Arguments: "{}"}}},
+		{Role: RoleTool, Parts: []Part{ToolResultPart{ToolCallID: "c2", Text: "ok"}}},
+	}
+	if got := RepairToolPairing(paired); len(got) != 2 {
+		t.Fatalf("paired history must be untouched: %+v", got)
+	}
+}
+
+// --- recovery shapes ---------------------------------------------------------
+
+func TestRecoveryShapes(t *testing.T) {
+	pureReasoning := StreamResult{SawReasoning: true, ReasoningText: "thinking"}
+	if !canRecover(pureReasoning, 1000) {
+		t.Fatal("cut pure-reasoning turn must recover")
+	}
+	silentStop := StreamResult{SawFinish: true, Finish: FinishStop, FinishToken: "end_turn", SawReasoning: true, ReasoningText: "thinking"}
+	if !canRecoverSilentStop(silentStop, 1000) {
+		t.Fatal("clean stop carrying only thinking must recover")
+	}
+	if canRecoverSilentStop(StreamResult{SawFinish: true, Finish: FinishStop, FinishToken: "failed", SawReasoning: true, ReasoningText: "t"}, 1000) {
+		t.Fatal("a failed ending must not read as a silent stop")
+	}
+	cutAnswer := StreamResult{SawFinish: true, Finish: FinishMaxTokens, SawText: true, AnswerText: "half an answer"}
+	if !canContinueFromCut(cutAnswer, 1000) {
+		t.Fatal("an answer cut at the output ceiling must continue")
+	}
+	if canContinueFromCut(cutAnswer, RecoveryTotalTimeoutMS+1) {
+		t.Fatal("the wall clock bounds continuations too")
+	}
+	if canContinueFromCut(StreamResult{SawFinish: true, Finish: FinishMaxTokens, SawToolCall: true}, 1000) {
+		t.Fatal("a tool turn must never take the answer-continuation path")
+	}
+}
+
+// --- failure classification --------------------------------------------------
+
+func TestClassifyHTMLPageAndClientCodes(t *testing.T) {
+	page := "<!doctype html><html><body>Request blocked</body></html>"
+	if got := ClassifyFailure(403, page, 0); got.Code != CodeClient {
+		t.Fatalf("a WAF page at 403 is the front proxy, not the credential store: %s", got.Code)
+	}
+	if got := ClassifyFailure(413, "payload too large", 0); got.Code != CodeClient {
+		t.Fatalf("413 is the request's own fault: %s", got.Code)
+	}
+	if got := ClassifyFailure(408, "timeout", 0); got.Code != CodeServer {
+		t.Fatalf("408 names the gateway's own timing trouble: %s", got.Code)
+	}
+	e := ClassifyFailure(403, page, 0)
+	if strings.Contains(e.Message, "<html") || !strings.Contains(e.Message, "front proxy") {
+		t.Fatalf("the message must name the hop, not quote the markup: %q", e.Message)
+	}
+}
+
+func TestClassifyKiloFailures(t *testing.T) {
+	if got := ClassifyKiloFailure(401, `{"error":{"code":"PAID_MODEL_AUTH_REQUIRED","message":"needs an account"}}`, 0); got.Code != CodeClient {
+		t.Fatalf("a paid id requested keyless is a request defect: %+v", got)
+	}
+	got := ClassifyKiloFailure(429, `{"error_type":"rate_limited"}`, 0)
+	if got.Code != CodeQuota {
+		t.Fatalf("error_type envelope must reshape onto the shared vocabulary: %+v", got)
+	}
+}
+
+// --- kilo catalog ------------------------------------------------------------
+
+func TestBuildKiloCatalog(t *testing.T) {
+	rows := []map[string]any{
+		{"id": "nvidia/nemotron-3-ultra:free", "name": "NVIDIA: Nemotron 3 Ultra (free)", "isFree": true,
+			"context_length":       128000.0,
+			"top_provider":         map[string]any{"max_completion_tokens": 32768.0},
+			"architecture":         map[string]any{"input_modalities": []any{"text", "image"}},
+			"supported_parameters": []any{"reasoning"}},
+		{"id": "stepfun/step-3:free", "name": "StepFun: Step 3 (free)", "isFree": true,
+			"supported_parameters": []any{"reasoning"}},
+		{"id": "vendor/paid-model", "isFree": false},
+		{"id": "nvidia/nemotron-3-ultra:free", "isFree": true},
+	}
+	cat := BuildKiloCatalog(rows)
+	if len(cat) != 2 {
+		t.Fatalf("free filter + dedupe wrong: %+v", cat)
+	}
+	m := cat[0]
+	if m.Channel != ChannelKilo || m.Wire != "chat" || !m.Vision || !m.Reasoning {
+		t.Fatalf("kilo entry fields wrong: %+v", m)
+	}
+	if m.ContextWindow != 128000 || m.MaxOutput != 32768 {
+		t.Fatalf("capacities wrong: %+v", m)
+	}
+	if m.Name != "Nemotron 3 Ultra" {
+		t.Fatalf("display name wrong: %q", m.Name)
+	}
+	if !m.CanDisableThinking {
+		t.Fatal("nemotron tolerates the off rung")
+	}
+	if cat[1].CanDisableThinking {
+		t.Fatal("stepfun refuses the off rung; its menu must not promise one")
+	}
+	if kiloEffortRung("light") != "low" || kiloEffortRung("balanced") != "medium" || kiloEffortRung("deep") != "high" {
+		t.Fatal("effort rung mapping wrong")
+	}
+}
+
+// The free-tier gate is a LANE verdict, not a credential verdict. It is
+// answered before the key is consulted (an invalid key draws the identical
+// document) and it lands on every model at once. Filing it as CodeCredential
+// stopped failover dead and surfaced upstream gate changes as a hard 401 in
+// the client — ZCode reported "Provider authentication failed" while the
+// gateway still had a working Kilo pool.
+func TestFreeTierErrorIsALaneVerdictNotACredentialOne(t *testing.T) {
+	body := `{"type":"error","error":{"type":"FreeTierError","message":"OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building."}}`
+	ue := ClassifyFailure(403, body, 0)
+	if ue.Code != CodeFreeTier {
+		t.Fatalf("FreeTierError classified as %s, want FREE_TIER_BLOCKED", ue.Code)
+	}
+	if !ue.Unavailable {
+		t.Error("a gate refusal marks the model unavailable for this exit")
+	}
+	// Switchable: the turn must be able to fall through to the Kilo pool
+	// instead of surfacing as a 401 to the client.
+	if !switchableFailure(ue) {
+		t.Fatal("the lane must be allowed to fail over past a free-tier gate refusal")
+	}
+	// NOT egress-retryable: unlike a region block (a verdict about the exit
+	// IP's country), this gate answers identically on every exit, so retrying
+	// them only spends the budget before the fallback is reached.
+	if egressRetryable(ue.Code) {
+		t.Fatal("a free-tier gate refusal must not spend the budget retrying exits")
+	}
+	// A genuine credential refusal must still read as one: this change must not
+	// turn "your key is wrong" into a silent failover.
+	auth := ClassifyFailure(401, `{"error":{"message":"invalid api key"}}`, 0)
+	if auth.Code != CodeCredential {
+		t.Fatalf("a real 401 = %s, want INVALID_CREDENTIAL", auth.Code)
+	}
+	if switchableFailure(auth) {
+		t.Fatal("a real credential error must not fail over")
 	}
 }

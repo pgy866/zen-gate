@@ -29,23 +29,28 @@ type openaiContentPart struct {
 }
 
 type openaiToolCall struct {
-	ID        string `json:"id"`
-	Type      string `json:"type"`
-	Function  struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
 }
 
 type openaiMessage struct {
-	Role       string          `json:"role"`
-	Content    json.RawMessage `json:"content"`
+	Role       string           `json:"role"`
+	Content    json.RawMessage  `json:"content"`
 	ToolCalls  []openaiToolCall `json:"tool_calls"`
-	ToolCallID string          `json:"tool_call_id"`
+	ToolCallID string           `json:"tool_call_id"`
+	// The thinking a previous assistant turn produced. Clients replay it so a
+	// thinking-mode upstream accepts the turn; dropping it here made every
+	// second turn fail with "reasoning_content must be passed back" (#99).
+	ReasoningContent string `json:"reasoning_content"`
+	Reasoning        string `json:"reasoning"`
 }
 
 type openaiToolDef struct {
-	Type string `json:"type"`
+	Type     string `json:"type"`
 	Function *struct {
 		Name        string          `json:"name"`
 		Description string          `json:"description"`
@@ -57,14 +62,14 @@ type openaiToolDef struct {
 }
 
 type openaiChatRequest struct {
-	Model               string           `json:"model"`
-	Messages            []openaiMessage  `json:"messages"`
-	Tools               []openaiToolDef  `json:"tools"`
-	Stream              bool             `json:"stream"`
-	MaxTokens           int              `json:"max_tokens"`
-	MaxCompletionTokens int              `json:"max_completion_tokens"`
-	ReasoningEffort     string           `json:"reasoning_effort"`
-	User                string           `json:"user"`
+	Model               string          `json:"model"`
+	Messages            []openaiMessage `json:"messages"`
+	Tools               []openaiToolDef `json:"tools"`
+	Stream              bool            `json:"stream"`
+	MaxTokens           int             `json:"max_tokens"`
+	MaxCompletionTokens int             `json:"max_completion_tokens"`
+	ReasoningEffort     string          `json:"reasoning_effort"`
+	User                string          `json:"user"`
 	StreamOptions       *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options"`
@@ -83,6 +88,12 @@ func convertOpenAIMessages(in []openaiMessage) []lane.Message {
 			parts := partsOfContent(m.Content, nil)
 			for _, tc := range m.ToolCalls {
 				parts = append(parts, lane.ToolCallPart{ID: tc.ID, Name: tc.Function.Name, Arguments: tc.Function.Arguments})
+			}
+			// Keep the replayed thinking, under either spelling a client uses.
+			if r := m.ReasoningContent; r != "" {
+				parts = append(parts, lane.ReasoningPart{Text: r})
+			} else if r := m.Reasoning; r != "" {
+				parts = append(parts, lane.ReasoningPart{Text: r})
 			}
 			out = append(out, lane.Message{Role: lane.RoleAssistant, Parts: parts})
 		case "tool":
@@ -265,7 +276,7 @@ func convertOpenAITools(in []openaiToolDef) []lane.ToolDef {
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var req openaiChatRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody)).Decode(&req); err != nil {
 		writeJSON(w, 400, openaiError("invalid request body: "+err.Error(), "invalid_request_error"))
 		return
 	}
@@ -384,17 +395,20 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sendChunk := func(delta map[string]any, finish any, usage any) {
-		choice := map[string]any{"index": 0, "delta": delta, "finish_reason": finish}
-		payload := map[string]any{
-			"id": id, "object": "chat.completion.chunk", "created": created,
-			"model": base, "choices": []any{choice},
+		if !sse.flushed {
+			// The role preamble commits the 200 the stream opens with, so it waits
+			// for the first byte of content: a lane that refuses before speaking
+			// must still be able to answer with a real 429 and Retry-After, which
+			// is what agents back off on.
+			sse.event(chunkPayload(id, created, base, map[string]any{"role": "assistant", "content": ""}, nil, nil))
 		}
-		if usage != nil {
-			payload["usage"] = usage
-		}
-		sse.event(payload)
+		sse.event(chunkPayload(id, created, base, delta, finish, usage))
 	}
-	sendChunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
+	inStreamFail := func(uerr *lane.UpstreamError) {
+		sse.event(map[string]any{"error": map[string]any{
+			"message": uerr.Message, "type": errorType(uerr), "code": uerr.Code}})
+		sse.done()
+	}
 
 	outcome, uerr := s.Lane.Complete(ctx, lane.Request{
 		Model: model, Effort: effort, Messages: unified,
@@ -436,6 +450,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if sse.flushed {
+			// The fallback put bytes on the wire before it failed: the 200 is
+			// committed, so report inside the stream rather than promising a
+			// status the client can no longer read.
+			inStreamFail(uerr)
+			return
+		}
 		setRetryAfter(w, uerr)
 		body := openaiError(uerr.Message, errorType(uerr))
 		if uerr.Code == lane.CodeQuota {
@@ -446,9 +467,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if uerr != nil {
 		// mid-stream failure after content went out: report as an SSE error
-		sse.event(map[string]any{"error": map[string]any{
-			"message": uerr.Message, "type": errorType(uerr), "code": uerr.Code}})
-		sse.done()
+		inStreamFail(uerr)
 		return
 	}
 	finish := "stop"
@@ -488,7 +507,11 @@ type chatEmitter struct {
 	declared map[string]bool
 	toolIdx  int
 	openTool map[int]*chatToolBuf
-	sawAny   bool
+	// lane block index → OpenAI tool_calls.index. Allocated when the block
+	// opens so parallel calls get distinct indexes immediately instead of
+	// sharing 0 until a block end arrives (issue #96).
+	toolNumber map[int]int
+	sawAny     bool
 }
 
 // declaredNames collects the tool names an OpenAI request declared.
@@ -512,6 +535,19 @@ type chatToolBuf struct {
 
 func (e *chatEmitter) hasAny() bool { return e.sawAny }
 
+// chunkPayload builds one chat.completion.chunk frame for the streaming paths
+// in openai.go and relay.go.
+func chunkPayload(id string, created int64, model string, delta map[string]any, finish any, usage any) map[string]any {
+	payload := map[string]any{
+		"id": id, "object": "chat.completion.chunk", "created": created,
+		"model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}},
+	}
+	if usage != nil {
+		payload["usage"] = usage
+	}
+	return payload
+}
+
 func (e *chatEmitter) consume(c lane.Chunk, text, reasoning *strings.Builder, toolCalls *[]map[string]any) {
 	e.sawAny = true
 	switch c.Kind {
@@ -524,8 +560,9 @@ func (e *chatEmitter) consume(c lane.Chunk, text, reasoning *strings.Builder, to
 			if e.openTool == nil {
 				e.openTool = map[int]*chatToolBuf{}
 			}
-			e.openTool[c.Index] = &chatToolBuf{id: c.ID, name: c.Name,
-				suppressed: isDecoy(c.Name) && !e.declared[c.Name]}
+			suppressed := isDecoy(c.Name) && !e.declared[c.Name]
+			e.openTool[c.Index] = &chatToolBuf{id: c.ID, name: c.Name, suppressed: suppressed}
+			e.numberTool(c.Index, suppressed)
 		}
 	case lane.ChunkToolCallDelta:
 		if e.openTool == nil {
@@ -546,10 +583,11 @@ func (e *chatEmitter) consume(c lane.Chunk, text, reasoning *strings.Builder, to
 		}
 		if buf, ok := e.openTool[c.Index]; ok {
 			delete(e.openTool, c.Index)
+			delete(e.toolNumber, c.Index)
 			if !buf.suppressed {
 				*toolCalls = append(*toolCalls, map[string]any{
-					"id":   buf.id,
-					"type": "function",
+					"id":       buf.id,
+					"type":     "function",
 					"function": map[string]any{"name": buf.name, "arguments": buf.args},
 				})
 			}
@@ -565,21 +603,30 @@ func (e *chatEmitter) stream(c lane.Chunk) []struct{ delta map[string]any } {
 	case lane.ChunkTextDelta:
 		out = append(out, struct{ delta map[string]any }{map[string]any{"content": c.Delta}})
 	case lane.ChunkReasonDelta:
-		out = append(out, struct{ delta map[string]any }{map[string]any{"reasoning": c.Delta}})
+		// Both spellings, always: non-streaming responses carry the thinking
+		// under reasoning_content (the DeepSeek/GLM-family de facto standard
+		// ZCode-class clients parse), while "reasoning" is what OpenRouter-
+		// family clients read. Sending only one silently loses the thinking
+		// process on the other half of the ecosystem (issue #31).
+		out = append(out, struct{ delta map[string]any }{map[string]any{
+			"reasoning":         c.Delta,
+			"reasoning_content": c.Delta,
+		}})
 	case lane.ChunkBlockStart:
 		if c.BlockType == "tool-call" {
 			if e.openTool == nil {
 				e.openTool = map[int]*chatToolBuf{}
 			}
-			e.openTool[c.Index] = &chatToolBuf{id: c.ID, name: c.Name,
-				suppressed: isDecoy(c.Name) && !e.declared[c.Name]}
+			suppressed := isDecoy(c.Name) && !e.declared[c.Name]
+			e.openTool[c.Index] = &chatToolBuf{id: c.ID, name: c.Name, suppressed: suppressed}
+			e.numberTool(c.Index, suppressed)
 		}
 	case lane.ChunkToolCallDelta:
 		if e.openTool != nil {
 			if buf, ok := e.openTool[c.Index]; ok && !buf.suppressed {
 				delta := map[string]any{
 					"tool_calls": []any{map[string]any{
-						"index": e.toolIdx,
+						"index": e.toolNumber[c.Index],
 						"id":    firstNonEmpty(buf.id, c.ID),
 						"function": map[string]any{
 							"name":      firstNonEmpty(buf.name, c.Name),
@@ -600,11 +647,25 @@ func (e *chatEmitter) stream(c lane.Chunk) []struct{ delta map[string]any } {
 		if e.openTool != nil {
 			if _, ok := e.openTool[c.Index]; ok {
 				delete(e.openTool, c.Index)
-				e.toolIdx++
+				delete(e.toolNumber, c.Index)
 			}
 		}
 	}
 	return out
+}
+
+// numberTool assigns the next OpenAI tool_calls.index to a newly opened lane
+// block. Suppressed decoys never reach the client, so they stay unnumbered and
+// leave no gap in the indexes.
+func (e *chatEmitter) numberTool(block int, suppressed bool) {
+	if suppressed {
+		return
+	}
+	if e.toolNumber == nil {
+		e.toolNumber = map[int]int{}
+	}
+	e.toolNumber[block] = e.toolIdx
+	e.toolIdx++
 }
 
 func isDecoy(name string) bool {
@@ -634,25 +695,37 @@ func mapFinish(f string) string {
 	}
 }
 
+// usagePayload renders one usage block for the OpenAI wire. prompt_tokens is
+// every prompt token the model saw (cached included) — that is what this
+// protocol means by it — and the hit portion also travels in
+// prompt_tokens_details so a client can show its own cache rate. Adding
+// Input + CacheRead naively double-counted every OpenAI-family upstream,
+// whose prompt_tokens already contains the hits.
 func usagePayload(u lane.Usage) map[string]any {
-	return map[string]any{
-		"prompt_tokens":     u.Input + u.CacheRead,
+	out := map[string]any{
+		"prompt_tokens":     u.InputTotal(),
 		"completion_tokens": u.Output,
-		"total_tokens":      u.Input + u.CacheRead + u.Output,
+		"total_tokens":      u.InputTotal() + u.Output,
 	}
+	if u.CacheRead > 0 {
+		out["prompt_tokens_details"] = map[string]any{"cached_tokens": u.CacheRead}
+	}
+	return out
 }
 
 func errorStatus(e *lane.UpstreamError) int {
 	switch e.Code {
 	case lane.CodeQuota:
 		return 429
-	case lane.CodeRegion:
+	case lane.CodeRegion, lane.CodeFreeTier:
 		return 403
 	case lane.CodeCredential:
 		return 401
+	case lane.CodeClient:
+		return 400
 	case lane.CodeTimeout:
 		return 504
-	case lane.CodeTransport, lane.CodeServer, lane.CodeEmpty:
+	case lane.CodeTransport, lane.CodeServer, lane.CodeEmpty, lane.CodeReset:
 		return 502
 	default:
 		return 502
@@ -663,8 +736,10 @@ func errorType(e *lane.UpstreamError) string {
 	switch e.Code {
 	case lane.CodeQuota:
 		return "rate_limit_error"
-	case lane.CodeRegion, lane.CodeCredential:
+	case lane.CodeRegion, lane.CodeFreeTier, lane.CodeCredential:
 		return "authentication_error"
+	case lane.CodeClient:
+		return "invalid_request_error"
 	default:
 		return "api_error"
 	}
@@ -685,13 +760,14 @@ type responsesRequest struct {
 }
 
 type responsesItem struct {
-	Type    string          `json:"type"`
-	Role    string          `json:"role,omitempty"`
-	Content json.RawMessage `json:"content,omitempty"`
-	CallID  string          `json:"call_id,omitempty"`
-	Name    string          `json:"name,omitempty"`
-	Arguments string        `json:"arguments,omitempty"`
-	Output  string          `json:"output,omitempty"`
+	Type      string          `json:"type"`
+	Role      string          `json:"role,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	Summary   json.RawMessage `json:"summary,omitempty"`
+	CallID    string          `json:"call_id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Arguments string          `json:"arguments,omitempty"`
+	Output    string          `json:"output,omitempty"`
 }
 
 func convertResponsesInput(raw json.RawMessage, instructions string) []lane.Message {
@@ -713,6 +789,7 @@ func convertResponsesInput(raw json.RawMessage, instructions string) []lane.Mess
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return out
 	}
+	pendingReasoning := ""
 	for _, it := range items {
 		switch it.Type {
 		case "", "message":
@@ -721,23 +798,70 @@ func convertResponsesInput(raw json.RawMessage, instructions string) []lane.Mess
 				role = "user"
 			}
 			parts := responsesContentParts(it.Content)
+			// A reasoning item precedes the assistant turn it belongs to;
+			// carrying it back is what lets a thinking-mode upstream accept
+			// the replayed turn (issue #99).
+			if role == lane.RoleAssistant && pendingReasoning != "" {
+				parts = append(parts, lane.ReasoningPart{Text: pendingReasoning})
+				pendingReasoning = ""
+			}
 			out = append(out, lane.Message{Role: role, Parts: parts})
+		case "reasoning":
+			if t := responsesReasoningText(it); t != "" {
+				pendingReasoning = t
+			}
 		case "function_call":
-			out = append(out, lane.Message{Role: lane.RoleAssistant,
-				Parts: []lane.Part{lane.ToolCallPart{ID: it.CallID, Name: it.Name, Arguments: it.Arguments}}})
+			parts := []lane.Part{lane.ToolCallPart{ID: it.CallID, Name: it.Name, Arguments: it.Arguments}}
+			if pendingReasoning != "" {
+				parts = append(parts, lane.ReasoningPart{Text: pendingReasoning})
+				pendingReasoning = ""
+			}
+			out = append(out, lane.Message{Role: lane.RoleAssistant, Parts: parts})
 		case "function_call_output":
 			out = append(out, lane.Message{Role: lane.RoleTool,
 				Parts: []lane.Part{lane.ToolResultPart{ToolCallID: it.CallID, Text: it.Output}}})
 		default:
-			// reasoning items are never echoed upstream
+			// Other item types have no unified representation; skip them.
 		}
 	}
 	return out
 }
 
+// responsesReasoningText reads the thinking out of a reasoning item, in
+// whichever shape the client sent: a content array (reasoning_text), a summary
+// array (summary_text), or a bare string.
+func responsesReasoningText(it responsesItem) string {
+	for _, raw := range []json.RawMessage{it.Summary, it.Content} {
+		if len(raw) == 0 || string(raw) == "null" {
+			continue
+		}
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			if s != "" {
+				return s
+			}
+			continue
+		}
+		var arr []struct {
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(raw, &arr) != nil {
+			continue
+		}
+		joined := ""
+		for _, p := range arr {
+			joined += p.Text
+		}
+		if joined != "" {
+			return joined
+		}
+	}
+	return ""
+}
+
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	var req responsesRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody)).Decode(&req); err != nil {
 		writeJSON(w, 400, openaiError("invalid request body: "+err.Error(), "invalid_request_error"))
 		return
 	}
@@ -773,7 +897,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		Model: model, Effort: effort, Messages: unified,
 		Tools: convertOpenAITools(req.Tools), MaxTokens: req.MaxOutputTokens,
 		SessionSeed: seed, TurnSeed: turn,
-			Agent:       agent, Needs: needs,
+		Agent: agent, Needs: needs,
 	}, collector.consume)
 	served := servedModel(outcome, base)
 	if uerr != nil && !collector.hasAnything() {
@@ -860,11 +984,15 @@ func (s *Server) writeResponsesEvents(w http.ResponseWriter, model string, c *re
 }
 
 func responsesUsage(u lane.Usage) map[string]any {
-	return map[string]any{
-		"input_tokens":  u.Input + u.CacheRead,
+	out := map[string]any{
+		"input_tokens":  u.InputTotal(),
 		"output_tokens": u.Output,
-		"total_tokens":  u.Input + u.CacheRead + u.Output,
+		"total_tokens":  u.InputTotal() + u.Output,
 	}
+	if u.CacheRead > 0 {
+		out["input_tokens_details"] = map[string]any{"cached_tokens": u.CacheRead}
+	}
+	return out
 }
 
 // responsesCollector buffers lane chunks into ordered output blocks so both

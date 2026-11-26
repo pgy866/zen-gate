@@ -6,9 +6,9 @@ import (
 )
 
 // RepairToolPairing removes dangling tool calls (assistant requests with no
-// later result) and orphan tool results. A request replayed upstream with an
-// unmatched tool call is rejected with 400 and then poisons the session for
-// every subsequent turn — the reference implementation repairs before sending.
+// later result) and orphan tool results, plus nameless call husks. A request
+// replayed upstream with an unmatched tool call is rejected with 400 and then
+// poisons the session for every subsequent turn — repair before sending.
 // Paired history is left untouched.
 func RepairToolPairing(messages []Message) []Message {
 	called := map[string]bool{}
@@ -17,7 +17,9 @@ func RepairToolPairing(messages []Message) []Message {
 		for _, p := range m.Parts {
 			switch t := p.(type) {
 			case ToolCallPart:
-				if t.ID != "" {
+				// A nameless call is not executable; marking it here means its
+				// result fails the paired-result test and goes with it.
+				if t.ID != "" && t.Name != "" {
 					called[t.ID] = true
 				}
 			case ToolResultPart:
@@ -33,7 +35,13 @@ func RepairToolPairing(messages []Message) []Message {
 		for _, p := range m.Parts {
 			switch t := p.(type) {
 			case ToolCallPart:
-				if t.ID != "" && resulted[t.ID] {
+				// A call with no name is not executable. One that reached the
+				// host was answered "unknown tool \"\"" — an *answered* call,
+				// so the result-presence test alone kept the husk in the
+				// history forever and every later turn 400'd on every model.
+				// A nameless call is dropped like an unanswered one; its
+				// result then fails the paired-result test and goes with it.
+				if t.ID != "" && t.Name != "" && resulted[t.ID] {
 					kept = append(kept, p)
 				}
 			case ToolResultPart:
@@ -98,13 +106,33 @@ func ToChatMessages(messages []Message) []map[string]any {
 			}
 		case RoleUser:
 			text := ""
+			// Anthropic clients feed tool results back inside the *user* turn
+			// (a tool_result block), so a user message can carry ToolResultPart.
+			// The chat wire has no such place: each result must become its own
+			// role:"tool" message, emitted ahead of the turn's own text —
+			// dropping it silently blanked every tool result on this wire
+			// (issue #48: upstream "tool interrupted" for Anthropic clients).
+			results := []map[string]any{}
 			for _, p := range m.Parts {
-				if t, ok := p.(TextPart); ok {
+				switch t := p.(type) {
+				case ToolResultPart:
+					results = append(results, map[string]any{
+						"role": "tool", "tool_call_id": t.ToolCallID, "content": t.Text})
+				case TextPart:
 					text += t.Text
-					continue
+				default:
+					if part := chatContentPart(p); part != nil {
+						pendingParts = append(pendingParts, part)
+					}
 				}
-				if part := chatContentPart(p); part != nil {
-					pendingParts = append(pendingParts, part)
+			}
+			// pendingParts is always empty at a user turn's start (every turn
+			// flushes), so the results land ahead of this turn's own text and
+			// media without a pre-flush dragging them in front.
+			if len(results) > 0 {
+				out = append(out, results...)
+				if text == "" && len(pendingParts) == 0 {
+					continue
 				}
 			}
 			content := any(text)
@@ -119,11 +147,14 @@ func ToChatMessages(messages []Message) []map[string]any {
 			flushParts()
 		case RoleAssistant:
 			text := ""
+			reasoning := ""
 			tools := []map[string]any{}
 			for _, p := range m.Parts {
 				switch t := p.(type) {
 				case TextPart:
 					text += t.Text
+				case ReasoningPart:
+					reasoning += t.Text
 				case ToolCallPart:
 					args := t.Arguments
 					if strings.TrimSpace(args) == "" {
@@ -140,6 +171,11 @@ func ToChatMessages(messages []Message) []map[string]any {
 				}
 			}
 			msg := map[string]any{"role": RoleAssistant, "content": text}
+			if reasoning != "" {
+				// A thinking-mode upstream refuses a replayed assistant turn
+				// whose reasoning was dropped (issue #99).
+				msg["reasoning_content"] = reasoning
+			}
 			if len(tools) > 0 {
 				msg["tool_calls"] = tools
 			}
@@ -172,7 +208,7 @@ func ToChatMessages(messages []Message) []map[string]any {
 func ToClaudeMessages(messages []Message) (system string, out []map[string]any) {
 	sysParts := []string{}
 	type pendingTurn struct {
-		role  string
+		role   string
 		blocks []map[string]any
 	}
 	turns := []pendingTurn{}
@@ -278,8 +314,15 @@ func ToResponseInput(messages []Message) (instructions string, out []map[string]
 		case RoleUser:
 			text := ""
 			items := []map[string]any{}
+			// As on the chat wire, Anthropic clients carry tool results inside
+			// the user turn; project each onto its own function_call_output
+			// item, ahead of the turn's message item (issue #48).
+			var outputs []map[string]any
 			for _, p := range m.Parts {
 				switch t := p.(type) {
+				case ToolResultPart:
+					outputs = append(outputs, map[string]any{"type": "function_call_output",
+						"call_id": t.ToolCallID, "output": t.Text})
 				case TextPart:
 					text += t.Text
 				case ImagePart:
@@ -295,6 +338,7 @@ func ToResponseInput(messages []Message) (instructions string, out []map[string]
 					items = append(items, item)
 				}
 			}
+			out = append(out, outputs...)
 			if strings.TrimSpace(text) != "" || len(items) > 0 {
 				if strings.TrimSpace(text) != "" {
 					items = append([]map[string]any{{"type": "input_text", "text": text}}, items...)

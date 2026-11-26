@@ -1,4 +1,4 @@
-//go:build windows
+//go:build windows && !headless
 
 package window
 
@@ -21,6 +21,7 @@ var (
 	procSetWindowLongPtr = user32.NewProc("SetWindowLongPtrW")
 	procSetWindowPos     = user32.NewProc("SetWindowPos")
 	procIsWindowVisible  = user32.NewProc("IsWindowVisible")
+	procDestroyWindow    = user32.NewProc("DestroyWindow")
 )
 
 const (

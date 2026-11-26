@@ -6,10 +6,19 @@ import (
 	"time"
 )
 
-// Recovery policy, ported from recovery.js.
+// Recovery policy: how a turn that ended without its answer gets one.
+//
+// The wall clock is the whole turn's backstop, not the only hang guard: the
+// transport layer holds its own no-byte idle cutoff (every chunk resets it),
+// so the wall clock only cuts turns that keep producing frames but slowly.
+// Pool-saturation spells (2026-10 实测: first token 34–220s, deep thinking
+// past six minutes) made the old 8-minute window cut healthy long turns, and
+// even 15 minutes lost "first segment + continuation" turns past seven —
+// hence 30. Continuations get the remainder of the window, not a fresh one.
+// Numbers may only ever move down from here; the bounded semantics stay.
 const (
-	RecoveryMaxContinuationMS = 180000
-	RecoveryTotalTimeoutMS    = 480000
+	RecoveryMaxContinuationMS = 1800000
+	RecoveryTotalTimeoutMS    = 1800000
 	RecoveryMaxOutputTokens   = 8192
 )
 
@@ -29,30 +38,79 @@ const recoveryInstruction = "The previous response was interrupted before its fi
 	"Do not merely summarize the interruption or promise to continue.\n\n" +
 	"Interrupted analysis checkpoint:\n"
 
+const continuationInstruction = "You reached the output token limit and your answer was cut off mid-way. " +
+	"Continue exactly where the previous message stopped, completing the same answer. " +
+	"Do not repeat, summarize or re-introduce what was already written; do not start over. " +
+	"Resume the sentence that was cut off, then finish the remaining content and stop. " +
+	"Do not call tools for this continuation."
+
+// maxConcurrentUpstream caps how many logical requests may be in flight to the
+// upstream at once; the rest queue. The exit pool is a set of shared public
+// proxies, and letting an unbounded number of requests pile through them makes
+// nodes drop connections (observed as more 502/EOF under higher concurrency).
+// Queueing is preferable to melting the pool, and it does not affect rotation —
+// each request still gets its own exit.
+const maxConcurrentUpstream = 6
+
+var upstreamSem = make(chan struct{}, maxConcurrentUpstream)
+
 // CallRecord is emitted after every upstream request (physical, not logical).
 type CallRecord struct {
-	Model      string `json:"model"`
-	Agent      string `json:"agent,omitempty"`
-	Ok         bool   `json:"ok"`
-	Truncated  bool   `json:"truncated,omitempty"`
-	NoUsage    bool   `json:"noUsage,omitempty"`
-	Recovered  bool   `json:"recovered,omitempty"`
-	Input      int    `json:"input"`
-	Output     int    `json:"output"`
-	Reasoning  int    `json:"reasoning,omitempty"`
-	CacheRead  int    `json:"cacheRead,omitempty"`
+	Model     string `json:"model"`
+	Agent     string `json:"agent,omitempty"`
+	Ok        bool   `json:"ok"`
+	Truncated bool   `json:"truncated,omitempty"`
+	NoUsage   bool   `json:"noUsage,omitempty"`
+	Recovered bool   `json:"recovered,omitempty"`
+	Input     int    `json:"input"`
+	Output    int    `json:"output"`
+	Reasoning int    `json:"reasoning,omitempty"`
+	CacheRead int    `json:"cacheRead,omitempty"`
+	// CacheWrite is what an Anthropic-family upstream billed to CREATE the
+	// cache (cache_creation_input_tokens). It costs more than a plain read, so
+	// a day bucket that drops it cannot tell "cache saved money" from "cache
+	// was paid for and never read".
+	CacheWrite int    `json:"cacheWrite,omitempty"`
 	TTFTMs     int64  `json:"ttftMs,omitempty"`
 	DecodeMs   int64  `json:"decodeMs,omitempty"`
 	DecodeTok  int    `json:"decodeTokens,omitempty"`
 	Effort     string `json:"effort,omitempty"`
 	At         int64  `json:"at"`
+	// Exit records which egress actually served this physical request. Under
+	// concurrency the first question asked is always whether these requests
+	// went out through the same exit; without it you can only guess. Empty
+	// means the direct fallback was used.
+	Exit string `json:"exit,omitempty"`
+	// Trace is the gateway correlation id of the client request this attempt
+	// served; empty for calls made outside a request.
+	Trace string `json:"trace,omitempty"`
+	// ErrCode/UpstreamRID carry the failure class and the provider's own trace
+	// id, which is the only handle their support has on a failed turn.
+	ErrCode     string `json:"errCode,omitempty"`
+	UpstreamRID string `json:"upstreamRequestId,omitempty"`
 }
 
 // Lane orchestrates the free lane: catalog, availability, and completion calls.
 type Lane struct {
-	mu               sync.RWMutex
-	catalog          []ModelInfo
-	availability     map[string]ProbeResult
+	mu           sync.RWMutex
+	catalog      []ModelInfo
+	availability map[string]ProbeResult
+	realOK       map[string]int64 // model -> unix-milli until which live traffic vouches for it
+	// hidden holds the ids the user unchecked on the 模型 page. Hidden models
+	// stay directly callable — a client that names one explicitly still gets
+	// it — but they stop consuming probe rounds and stop acting as
+	// failover / throttle-switch candidates (issue #103). SetHidden replaces
+	// the whole map and readers snapshot the reference under mu, so never
+	// edit the map in place.
+	hidden map[string]bool
+	// channelGate reports whether a free-lane channel is enabled (its
+	// channels/<id>.json file). nil means every channel is on. A disabled
+	// channel empties its catalog bucket — the same shape as a logged-out
+	// account — so its models leave every picker and nothing routes to it.
+	channelGate func(string) bool
+	// OnChannelRoster receives each channel's live roster after a catalog
+	// rebuild, for the per-channel files (store.WriteChannelRoster).
+	OnChannelRoster  func(channel string, models []ModelInfo)
 	egress           Egress
 	defaultMaxTokens int
 	exposeRegion     bool
@@ -63,12 +121,74 @@ type Lane struct {
 	ttft             TTFTSource
 	throttle         *ThrottleBook
 
-	probing        atomicFlag
-	lastProbeAt    time.Time
-	backoffRounds  int
-	nextProbeAfter time.Time
+	// wbCacheKey asks the WorkBuddy gateways to bucket their prefix cache by
+	// our conversation id (prompt_cache_key). Off by default: the field is
+	// measured on the reference client but not yet on this lane, and an
+	// unverified body field on a WAF-fronted gateway is a way to break working
+	// traffic. Turn it on from 设置 once a live A/B says it is accepted.
+	wbCacheKey bool
+
+	// WorkBuddy 账号渠道 state. The pool lives in workbuddy_pool.go: wbMu
+	// guards the slot slice and the active pointer only, while each slot
+	// carries its own mutex — upstream rotates the refresh token on every
+	// refresh, so two overlapping refreshes of the SAME account void the
+	// second pair, and one account's refresh must not block another's turn.
+	wbMu       sync.RWMutex
+	wbSlots    []*wbSlot
+	wbActiveID string
+	wbPersist  func(WBAccount)
+	// Logf receives the pool's diagnostics (account switches, cooldowns). Nil
+	// in tests and headless embeds, where it stays silent.
+	Logf         func(string, ...any)
+	wbLoginState string
+	wbLoginAt    time.Time
+	// wbLoginRealm is the region the in-flight login was opened against. The
+	// browser finishes the login on that publishment, so the state poll and
+	// the token it mints must both go back to the same one.
+	wbLoginRealm string
+
+	// CodeArts 账号渠道 state. caMu serializes the STS refresh — the refresh
+	// token is bound to a DPoP keypair and the login's code_verifier, so a
+	// half-written rotation locks the account out — and guards the snapshot.
+	caMu          sync.Mutex
+	caAcct        CAAccount
+	caPersist     func(CAAccount)
+	caRefreshedAt time.Time
+	caLogin       *caPendingLogin
+
+	// ZCode account pool. The login is a device-authorization flow this gateway
+	// owns end to end (no IDE, no local callback port), so the accounts are ours
+	// to store and spend. zcPersist writes one account after a login.
+	zcMu      sync.RWMutex
+	zcAccts   []ZCodeAccount
+	zcPersist func(ZCodeAccount)
+
+	// TRAE account pool: a Cloud-IDE-JWT login plus the desktop fingerprint
+	// (machine id / device id) the upstream scores. trPersist writes rotations.
+	trMu      sync.RWMutex
+	trAccts   []TraeAccount
+	trPersist func(TraeAccount)
+
+	// Preset "OpenAI-compatible + private headers" channel pool (cline / loomy /
+	// raccoon / lobsterai / astudio / modelscope). They share one transport and
+	// differ only in URL, headers and a body quirk, so one pool serves all six.
+	extMu      sync.RWMutex
+	extAccts   []ExtAccount
+	extPersist func(ExtAccount)
+
+	probing         atomicFlag
+	lastProbeAt     time.Time
+	backoffRounds   int
+	nextProbeAfter  time.Time
 	quotaWallActive bool
 	probingModel    string
+	// probeDone / probeTotal are this round's progress: a whole round is many
+	// upstream calls that can take minutes, and until they existed the panel
+	// could only spin a button — the user could not tell "running" from
+	// "stuck" (issue #117). Counting starts after the round's model list is
+	// fixed, so the denominator does not drift mid-round.
+	probeDone  int
+	probeTotal int
 
 	// OnCall receives one record per physical upstream request.
 	OnCall func(CallRecord)
@@ -80,6 +200,14 @@ type Lane struct {
 	// OnProbeResult fires after each individual model probe finished — main
 	// uses it to feed the per-model first-token sample history.
 	OnProbeResult func(ProbeResult)
+	// OnCatalogReload fires after RefreshCatalog swapped in a rebuilt catalog
+	// (curated table + upstream listing, no tags). The catalog rebuild drops
+	// every tag-patched verdict, and until this hook existed the only re-apply
+	// ran once at boot — a probe-verified modality or an externally supplied
+	// capacity silently vanished 30 minutes in, leaving routing and agent
+	// injection back on the name guess. Owners must replay their stored
+	// verdicts here, before notify() lets readers take the fresh snapshot.
+	OnCatalogReload func()
 }
 
 type atomicFlag struct{ v int32 }
@@ -98,6 +226,7 @@ func NewLane() *Lane {
 	return &Lane{
 		catalog:          BuildCatalog(FallbackCatalogIDs),
 		availability:     map[string]ProbeResult{},
+		realOK:           map[string]int64{},
 		defaultMaxTokens: 32768,
 		exposeRegion:     true,
 		failoverEnabled:  true,
@@ -106,6 +235,58 @@ func NewLane() *Lane {
 		strategy:         StrategyCatalog,
 		throttle:         NewThrottleBook(),
 	}
+}
+
+// SetCatalog installs a catalog wholesale and replays the persisted verdicts.
+// RefreshCatalog is the production path; this entry exists for tests and for a
+// caller that already holds the rows, so neither has to reach upstream to get a
+// pickable model.
+func (l *Lane) SetCatalog(cat []ModelInfo) {
+	l.mu.Lock()
+	l.catalog = cat
+	l.mu.Unlock()
+	if l.OnCatalogReload != nil {
+		l.OnCatalogReload()
+	}
+	l.notify()
+}
+
+// SetChannelGate installs the per-channel enable check read from the
+// channels/<id>.json files. nil keeps every channel on.
+func (l *Lane) SetChannelGate(fn func(string) bool) {
+	l.mu.Lock()
+	l.channelGate = fn
+	l.mu.Unlock()
+	l.notify()
+}
+
+func (l *Lane) channelOn(id string) bool {
+	return l.channelGate == nil || l.channelGate(id)
+}
+
+// SetWorkBuddyCacheKey enables the WorkBuddy prompt_cache_key hint. Default
+// off; see the field's own comment for why.
+func (l *Lane) SetWorkBuddyCacheKey(on bool) {
+	l.mu.Lock()
+	l.wbCacheKey = on
+	l.mu.Unlock()
+}
+
+func (l *Lane) workBuddyCacheKey() bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.wbCacheKey
+}
+
+// SetHidden replaces the set of user-hidden model ids. Hidden models remain
+// directly callable; they only drop out of the probe round and the failover
+// candidate scan (issue #103). The lane takes ownership of the map — callers
+// must hand over a fresh one, not a map they keep mutating.
+func (l *Lane) SetHidden(ids map[string]bool) {
+	l.mu.Lock()
+	l.hidden = ids
+	l.mu.Unlock()
+	l.notify()
 }
 
 // SetFailover toggles rate-limit auto-switching and its extra-attempt budget.
@@ -142,16 +323,57 @@ func (l *Lane) MarkThrottled(model string, retryAfterSec int) {
 	l.fireChange()
 }
 
-// MarkOK clears a model's throttle state after a successful call or probe.
-func (l *Lane) MarkOK(model string) {
-	l.throttle.MarkOK(model)
+// realSuccessProtect is how long live traffic outranks the probe scheduler.
+const realSuccessProtect = 10 * time.Minute
+
+// NoteRealSuccess is the correction from live traffic: a call that answered
+// proves the model works, so it flips the panel to available straight away and
+// holds a probe's negative verdict down for a window. Without the window the
+// next round writes the throttle verdict back over a model that is
+// demonstrably answering, which is how the panel and the truth drifted apart.
+//
+// vouchedFor is only ever called with l.mu already held, so there is no
+// re-entrant acquisition to deadlock on.
+func (l *Lane) NoteRealSuccess(model string) {
 	l.mu.Lock()
-	if prev, ok := l.availability[model]; ok && prev.State == StateThrottled {
-		l.availability[model] = ProbeResult{Model: model, State: StateAvailable,
-			At: time.Now().UnixMilli(), Detail: "恢复（实测成功）"}
+	now := time.Now()
+	l.realOK[model] = now.Add(realSuccessProtect).UnixMilli()
+	prev, known := l.availability[model]
+	if known && prev.State == StateAvailable {
+		l.mu.Unlock()
+		return
+	}
+	l.availability[model] = ProbeResult{Model: model, State: StateAvailable,
+		At: now.UnixMilli(), Detail: "真实请求成功（实测可用）"}
+	l.mu.Unlock()
+	l.throttle.MarkOK(model)
+	l.fireChange()
+}
+
+// vouchedFor reports whether live traffic still speaks for the model. Callers
+// must hold l.mu.
+func (l *Lane) vouchedFor(model string) bool {
+	until, ok := l.realOK[model]
+	return ok && time.Now().UnixMilli() < until
+}
+
+// applyVerdict publishes one probe conclusion, unless live traffic vouches for
+// the model. It reports the conclusion that landed and whether anything changed.
+func (l *Lane) applyVerdict(model string, r ProbeResult) (ProbeResult, bool) {
+	l.mu.Lock()
+	prev, known := l.availability[model]
+	blocked := l.vouchedFor(model)
+	if !blocked {
+		l.availability[model] = r
 	}
 	l.mu.Unlock()
-	l.fireChange()
+	if blocked {
+		return prev, false
+	}
+	if known && l.OnProbeEdge != nil && prev.State != r.State && prev.State != "" && r.State != "" {
+		go l.OnProbeEdge(model, prev.State, r.State)
+	}
+	return r, true
 }
 
 func (l *Lane) fireChange() {
@@ -193,6 +415,15 @@ func (l *Lane) ProbingModel() string {
 	return l.probingModel
 }
 
+// ProbeProgress returns (done, total) for the running round. total is 0 when
+// no round is running. The dashboard prints "已探测 12/35 · 正在测 xxx" from
+// these two numbers plus ProbingModel.
+func (l *Lane) ProbeProgress() (int, int) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.probeDone, l.probeTotal
+}
+
 // Snapshot returns the current catalog + availability + egress.
 func (l *Lane) Snapshot() ([]ModelInfo, map[string]ProbeResult, Egress) {
 	l.mu.RLock()
@@ -206,10 +437,11 @@ func (l *Lane) Snapshot() ([]ModelInfo, map[string]ProbeResult, Egress) {
 	return cat, av, l.egress
 }
 
-// ServableModels lists models a client picker may show: everything not
-// explicitly refused by the gateway. Region-blocked ids are kept only when
-// exposeRegion is set (they surface in the dashboard, never silently vanish).
-// The list never comes back empty while any model is known.
+// ServableModels lists models a client picker may show. A probe verdict is not
+// a filter here: it is one exit sampled once, and deleting the id from
+// GET /v1/models is how a working model becomes unselectable for every client.
+// Only the model's own nature removes it — a decision model answers on a
+// different wire and would 500 — plus the user's exposeRegion switch.
 func (l *Lane) ServableModels() []ModelInfo {
 	cat, av, _ := l.Snapshot()
 	out := []ModelInfo{}
@@ -219,13 +451,8 @@ func (l *Lane) ServableModels() []ModelInfo {
 			// chat requests — listing them in a chat picker would only 500.
 			continue
 		}
-		switch av[m.ID].State {
-		case StateUnavailable:
+		if FreshState(av[m.ID]) == StateRegionBlock && !l.exposeRegion {
 			continue
-		case StateRegionBlock:
-			if !l.exposeRegion {
-				continue
-			}
 		}
 		out = append(out, m)
 	}
@@ -235,17 +462,280 @@ func (l *Lane) ServableModels() []ModelInfo {
 	return out
 }
 
-// RefreshCatalog re-pulls the listing; a failure keeps the cached catalog.
+// RefreshCatalog re-pulls both listings; a failure on either keeps that
+// source's cached slice.
 func (l *Lane) RefreshCatalog(ctx context.Context) {
-	ids, err := FetchListing(ctx)
-	if err != nil || len(ids) == 0 {
+	// Each source keeps its previous slice when its own listing fails. The
+	// rebuild starts from the cached catalog rather than from nothing, because
+	// a catalog that shrinks when a fetch merely blipped loses models that are
+	// still perfectly usable — and that loss is not cosmetic: the agent
+	// adapters are re-injected from this list, so a model that vanishes here
+	// vanishes from every client's picker too.
+	//
+	// Observed: one boot where the Zen listing lost its race with sing-box's
+	// first inbound left the catalog holding only the 4 Kilo rows. All six Zen
+	// models were still listed by the upstream and kept serving requests, but
+	// they were gone from the gateway's own /v1/models and from ZCode until the
+	// next restart happened to win the race. A refresh may only ever ADD to
+	// what it does not know, never subtract on a failed round trip.
+	l.mu.Lock()
+	prev := l.catalog
+	l.mu.Unlock()
+
+	var zen, kilo, wb, ca, zc, tr []ModelInfo
+	for _, m := range prev {
+		switch m.Channel {
+		case ChannelKilo:
+			kilo = append(kilo, m)
+		case ChannelWorkBuddy:
+			wb = append(wb, m)
+		case ChannelCodeArts:
+			ca = append(ca, m)
+		case ChannelZCode:
+			zc = append(zc, m)
+		case ChannelTrae:
+			tr = append(tr, m)
+		default:
+			zen = append(zen, m)
+		}
+	}
+	subtracted := false
+	// A channel disabled in its channels/<id>.json file empties exactly like a
+	// logged-out account: deliberate absence publishes, a fetch blip keeps.
+	if l.channelOn("zen") {
+		if ids, err := fetchListingWithColdBootRetry(ctx, len(zen), fetchZenListing); err == nil && len(ids) > 0 {
+			zen = BuildCatalog(ids)
+		}
+	} else {
+		if len(zen) > 0 {
+			subtracted = true
+		}
+		zen = nil
+	}
+	if l.channelOn("kilo") {
+		if rows, err := fetchListingWithColdBootRetry(ctx, len(kilo), fetchKiloListing); err == nil && len(rows) > 0 {
+			kilo = BuildKiloCatalog(rows)
+		}
+	} else {
+		if len(kilo) > 0 {
+			subtracted = true
+		}
+		kilo = nil
+	}
+	// The WorkBuddy roster is static (three curated free models), so unlike
+	// the two fetched sources it cannot fail a fetch — the only gates are the
+	// channel file and the account. Logging out empties the bucket on purpose:
+	// logged-out models must leave the pickers, a subtract that is the point here.
+	if l.channelOn("workbuddy") && l.wbServeable() {
+		wb = buildWorkBuddyCatalog()
+	} else {
+		if len(wb) > 0 {
+			subtracted = true
+		}
+		wb = nil
+	}
+	// CodeArts is the fourth source: a fetched roster (builtin + rotating
+	// benefit models), so it follows the zen/kilo discipline — a failed fetch
+	// keeps the previous bucket rather than emptying it, and only a logged-out
+	// account subtracts. Logged in, discovery also seeds the per-account
+	// benefit flags the post path reads back, so this call is load-bearing,
+	// not just a name list.
+	if !l.channelOn("codearts") {
+		if len(ca) > 0 {
+			subtracted = true
+		}
+		ca = nil
+	} else if acct, ok := l.codeArtsReady(); ok {
+		if fresh, err := fetchListingWithColdBootRetry(ctx, len(ca), func(context.Context) ([]ModelInfo, error) {
+			return caFetchModels(acct)
+		}); err == nil && len(fresh) > 0 {
+			ca = fresh
+		}
+	} else {
+		if len(ca) > 0 {
+			subtracted = true
+		}
+		ca = nil
+	}
+	// The six preset channels (cline / loomy / raccoon / lobsterai / astudio /
+	// modelscope) share one transport but keep separate buckets, because their
+	// rosters come from six different endpoints and one vendor being down must
+	// not empty another's picker.
+	extBuckets := map[string][]ModelInfo{}
+	for _, m := range prev {
+		if _, isPreset := extPresets[m.Channel]; isPreset {
+			extBuckets[m.Channel] = append(extBuckets[m.Channel], m)
+		}
+	}
+	for _, kind := range extKindOrder {
+		bucket := extBuckets[kind]
+		if !l.channelOn(kind) {
+			if len(bucket) > 0 {
+				subtracted = true
+			}
+			extBuckets[kind] = nil
+			continue
+		}
+		accts := l.extSpendable(kind)
+		if len(accts) == 0 {
+			// No account means the channel has nothing to serve; emptying is
+			// the point, exactly like a logged-out WorkBuddy.
+			if len(bucket) > 0 {
+				subtracted = true
+			}
+			extBuckets[kind] = nil
+			continue
+		}
+		p := extPresets[kind]
+		if fresh, err := fetchListingWithColdBootRetry(ctx, len(bucket), func(fctx context.Context) ([]ModelInfo, error) {
+			return extFetchCatalog(fctx, p, accts[0])
+		}); err == nil && len(fresh) > 0 {
+			extBuckets[kind] = fresh
+		}
+	}
+
+	if !l.channelOn("zcode") {
+		if len(zc) > 0 {
+			subtracted = true
+		}
+		zc = nil
+	} else if accts := l.zcodeSpendable(); len(accts) > 0 {
+		if fresh, err := fetchListingWithColdBootRetry(ctx, len(zc), func(fctx context.Context) ([]ModelInfo, error) {
+			rows, rerr := zcodeFetchConfigs(fctx, accts[0])
+			if rerr != nil {
+				return nil, rerr
+			}
+			setZcodeLevels(rows)
+			return zcodeBuildCatalog(rows), nil
+		}); err == nil && len(fresh) > 0 {
+			zc = fresh
+		}
+	} else {
+		if len(zc) > 0 {
+			subtracted = true
+		}
+		zc = nil
+	}
+	// TRAE's roster is LIVE but channel-attributed: a model is only callable
+	// through the channel that listed it, so the fetch records the routing
+	// alongside the ids. Same discipline: a failed fetch keeps, a logged-out
+	// account subtracts.
+	if !l.channelOn("trae") {
+		if len(tr) > 0 {
+			subtracted = true
+		}
+		tr = nil
+	} else if accts := l.traeSpendable(); len(accts) > 0 {
+		if fresh, err := fetchListingWithColdBootRetry(ctx, len(tr), func(fctx context.Context) ([]ModelInfo, error) {
+			rows, routes, rerr := traeFetchModels(fctx, accts[0])
+			if rerr != nil {
+				return nil, rerr
+			}
+			setTraeRoutes(routes)
+			return rows, nil
+		}); err == nil && len(fresh) > 0 {
+			tr = fresh
+		}
+	} else {
+		if len(tr) > 0 {
+			subtracted = true
+		}
+		tr = nil
+	}
+	cat := make([]ModelInfo, 0, len(zen)+len(kilo)+len(wb)+len(ca)+len(zc)+len(tr)+64)
+	cat = append(cat, zen...)
+	cat = append(cat, kilo...)
+	cat = append(cat, wb...)
+	cat = append(cat, ca...)
+	cat = append(cat, zc...)
+	cat = append(cat, tr...)
+	for _, kind := range extKindOrder {
+		cat = append(cat, extBuckets[kind]...)
+	}
+	if len(cat) == 0 && !subtracted {
 		return
 	}
-	cat := BuildCatalog(ids)
 	l.mu.Lock()
 	l.catalog = cat
 	l.mu.Unlock()
+	// Publish each channel's live roster to its own file (one channel, one
+	// file): this is the attribution record — which source serves which id.
+	if l.OnChannelRoster != nil {
+		byChannel := map[string][]ModelInfo{}
+		for _, m := range cat {
+			id := m.Channel
+			if id == "" {
+				id = "zen"
+			}
+			byChannel[id] = append(byChannel[id], m)
+		}
+		for _, ch := range Channels() {
+			// A disabled channel keeps its last recorded roster: the file then
+			// still says what the channel would serve, which is the point of
+			// keeping per-channel files at all.
+			if !l.channelOn(ch) {
+				continue
+			}
+			l.OnChannelRoster(ch, byChannel[ch])
+		}
+	}
+	// Replay persisted verdicts synchronously before the broadcast: every
+	// reader woken by notify() (dashboard, agent injection, the lane's own
+	// capability filter) must see the tags-bearing catalog, not the raw
+	// rebuild for one window.
+	if l.OnCatalogReload != nil {
+		l.OnCatalogReload()
+	}
 	l.notify()
+}
+
+// coldBootRetryDelay is how long a listing waits before its single retry. It is
+// deliberately short: a first attempt that fails while the process is starting
+// has usually lost a race with something that is about to be ready — sing-box's
+// first inbound comes up seconds after the gateway does — rather than hit an
+// outage a longer wait would outlast.
+// Listing-fetch indirection: vars so tests can stand in fake rosters.
+var (
+	fetchZenListing  = FetchListing
+	fetchKiloListing = FetchKiloListing
+)
+
+const coldBootRetryDelay = 3 * time.Second
+
+// fetchListingWithColdBootRetry runs a source listing and, when the catalog
+// holds nothing for that source yet, gives a failed attempt one more chance.
+//
+// The rebuild already keeps the previous slice of whichever source failed, which
+// makes a mid-life blip survivable (see RefreshCatalog). A cold boot has no such
+// slice to keep, so the same blip drops the source outright: its models stay
+// listed upstream and keep serving, but they are missing from /v1/models and
+// from every client the agent adapters are injected into, and nothing retries
+// until the next probe round, 30 minutes by default.
+//
+// Observed 2026-10-11, immediately after a restart: the Kilo listing failed once
+// (one exit in the rotation refusing the connection) while the Zen listing
+// succeeded, /v1/models came up holding only the six Zen rows, and the ZCode
+// adapter was re-injected with that short roster. The twelve Kilo rows returned
+// on the next boot. A failed listing logs nothing, so the only symptom visible
+// to the user was a picker listing fewer models than the upstream does.
+//
+// Retrying is limited to the cold case on purpose: with rows already cached the
+// failure costs nothing, and a listing that answers successfully with no rows is
+// an answer rather than a failure.
+func fetchListingWithColdBootRetry[T any](ctx context.Context, cached int, fetch func(context.Context) ([]T, error)) ([]T, error) {
+	rows, err := fetch(ctx)
+	if cached > 0 || err == nil {
+		return rows, err
+	}
+	select {
+	case <-ctx.Done():
+		return rows, err
+	case <-time.After(coldBootRetryDelay):
+	}
+	if retried, retryErr := fetch(ctx); retryErr == nil {
+		return retried, nil
+	}
+	return rows, err
 }
 
 // ProbeRound re-probes availability once, with exponential backoff after an
@@ -261,39 +751,73 @@ func (l *Lane) ProbeRound(ctx context.Context, manual bool) {
 		return
 	}
 	l.probing.Set(true)
-	cat := make([]ModelInfo, len(l.catalog))
-	copy(cat, l.catalog)
+	cat := make([]ModelInfo, 0, len(l.catalog))
+	for _, m := range l.catalog {
+		if !l.hidden[m.ID] {
+			cat = append(cat, m)
+		}
+	}
+	// The denominator is fixed here, together with the list it counts: Kilo
+	// rows resolve without an upstream call, so they count as done immediately
+	// rather than inflating a total the round will never reach.
+	l.probeDone, l.probeTotal = 0, 0
+	for _, m := range cat {
+		if m.Channel != ChannelKilo {
+			l.probeTotal++
+		}
+	}
 	l.mu.Unlock()
-	defer l.probing.Set(false)
+	defer func() {
+		l.probing.Set(false)
+		l.mu.Lock()
+		l.probeDone, l.probeTotal = 0, 0
+		l.mu.Unlock()
+		l.notify()
+	}()
 
 	// 逐个探测：一次只测一个模型，测完一个立刻生效并广播——
 	// 用户看到的是模型一个接一个亮起来，而不是全轮结束后一起翻转。
+	// Kilo 池不探测：它的名单每轮随 listing 重建，在列即可用，
+	// 探测只会白白烧一次调度。
+	// 用户取消勾选的模型同样不进轮次：探测是真实出网的上游调用，
+	// 烧的是账号配额，Hidden 是 UI 概念但探测预算不是 (#103)。
 	allThrottled := len(cat) > 0
+	probed := 0
 	for _, m := range cat {
 		if ctx.Err() != nil {
 			break
+		}
+		if m.Channel == ChannelKilo {
+			// 在列即判定可用，但必须每轮重盖时间戳：FreshState 按 At 判过期
+			// (stateTTL=10m)，而轮次间隔默认 15m。旧代码只在"没有条目/State 为空"
+			// 时写入，于是第一轮之后时间戳永远停在那一刻——10 分钟后整批 Kilo
+			// 行一起变成"未探测"、变灰、从总览「可用」里消失，而池子其实一直在
+			// 正常服务 (#123)。
+			l.mu.Lock()
+			l.availability[m.ID] = ProbeResult{Model: m.ID, State: StateAvailable,
+				At: time.Now().UnixMilli(), Detail: "在列（免费池名单即判定）"}
+			allThrottled = false
+			l.mu.Unlock()
+			continue
 		}
 		l.mu.Lock()
 		l.probingModel = m.ID
 		l.mu.Unlock()
 		l.notify()
 
-		r := ProbeModel(ctx, m)
-
+		r := recheckNegative(ctx, m, l.probeModelFor(ctx, m), l.probeModelFor)
+		probed++
 		l.mu.Lock()
-		if l.OnProbeEdge != nil {
-			if prev, ok := l.availability[m.ID]; ok && prev.State != r.State && prev.State != "" && r.State != "" {
-				go l.OnProbeEdge(m.ID, prev.State, r.State)
-			}
-		}
-		l.availability[m.ID] = r
-		if r.State != StateThrottled {
+		l.probeDone++
+		l.mu.Unlock()
+
+		effective, _ := l.applyVerdict(m.ID, r)
+		if effective.State != StateThrottled {
 			allThrottled = false
 		}
-		l.mu.Unlock()
 		// Probe verdicts feed the throttle ledger too: a throttled verdict
 		// opens/extends an episode, a usable one closes it.
-		switch r.State {
+		switch effective.State {
 		case StateThrottled:
 			l.throttle.MarkThrottled(m.ID, 0)
 		case StateAvailable:
@@ -310,15 +834,18 @@ func (l *Lane) ProbeRound(ctx context.Context, manual bool) {
 	eg := DetectEgress(ctx)
 
 	l.mu.Lock()
-	if l.OnProbeEdge != nil && allThrottled && !l.quotaWallActive {
+	// 配额墙只在真的探测过至少一个模型时才成立：全部被取消勾选的轮次
+	// 一无所知，不能当作全池 429 去触发通知与长退避。
+	quotaWall := allThrottled && probed > 0
+	if l.OnProbeEdge != nil && quotaWall && !l.quotaWallActive {
 		go l.OnProbeEdge("", "", StateThrottled)
 	}
-	l.quotaWallActive = allThrottled
+	l.quotaWallActive = quotaWall
 	if egressChanged(l.egress, eg) {
 		l.egress = eg
 	}
 	l.lastProbeAt = time.Now()
-	if allThrottled {
+	if quotaWall {
 		l.backoffRounds++
 		d := time.Duration(30*(1<<uint(min2(l.backoffRounds, 2)))) * time.Minute
 		if d > 120*time.Minute {
@@ -337,6 +864,13 @@ func (l *Lane) ProbeRound(ctx context.Context, manual bool) {
 // applies the same bookkeeping as a round: availability, throttle ledger,
 // first-token sample, change notifications.
 func (l *Lane) ProbeOne(model string) ProbeResult {
+	return l.ProbeOneCtx(context.Background(), model)
+}
+
+// ProbeOneCtx is ProbeOne through a context that may carry a probe phase sink,
+// so a caller watching one card sees the request go out and the answer start
+// instead of waiting blind for a queued free lane.
+func (l *Lane) ProbeOneCtx(ctx context.Context, model string) ProbeResult {
 	var entry ModelInfo
 	l.mu.RLock()
 	for i := range l.catalog {
@@ -350,14 +884,20 @@ func (l *Lane) ProbeOne(model string) ProbeResult {
 		return ProbeResult{Model: model, State: StateUnknown, At: time.Now().UnixMilli()}
 	}
 
-	r := ProbeModel(context.Background(), entry)
-
-	l.mu.Lock()
-	if prev, ok := l.availability[model]; ok && l.OnProbeEdge != nil && prev.State != r.State && prev.State != "" && r.State != "" {
-		go l.OnProbeEdge(model, prev.State, r.State)
+	var r ProbeResult
+	if entry.Channel == ChannelKilo {
+		// Presence in the free-pool roster is the verdict; probing would only
+		// spend a scheduling slot.
+		r = ProbeResult{Model: entry.ID, State: StateAvailable, At: time.Now().UnixMilli(),
+			Detail: "在列（免费池名单即判定）"}
+		l.applyVerdict(model, r)
+	} else {
+		// The button asks "can this model answer right now", so the raw verdict
+		// is what the caller sees; the stored state is still guarded by live
+		// traffic.
+		r = recheckNegative(ctx, entry, l.probeModelFor(ctx, entry), l.probeModelFor)
+		r, _ = l.applyVerdict(model, r)
 	}
-	l.availability[model] = r
-	l.mu.Unlock()
 	switch r.State {
 	case StateThrottled:
 		l.throttle.MarkThrottled(model, 0)
@@ -369,6 +909,19 @@ func (l *Lane) ProbeOne(model string) ProbeResult {
 	}
 	l.notify()
 	return r
+}
+
+// probeModelFor routes one availability probe to the source that can answer
+// it: the WorkBuddy channel probes through its own account (ProbeModel is
+// hardwired to the Zen endpoint), everything else goes to the shared prober.
+func (l *Lane) probeModelFor(ctx context.Context, m ModelInfo) ProbeResult {
+	if m.Channel == ChannelWorkBuddy {
+		return l.probeWorkBuddy(ctx, m)
+	}
+	if m.Channel == ChannelCodeArts {
+		return l.probeCodeArts(ctx, m)
+	}
+	return ProbeModel(ctx, m)
 }
 
 // StartLoops runs the periodic catalog refresh + probe + egress watch until
@@ -434,15 +987,52 @@ func (l *Lane) notify() {
 	}
 }
 
+// quotaEgressRetries caps the extra exits one request tries after a 429 while
+// rotation is live. Each retry costs one upstream round-trip and no quota (a
+// refused request never consumed any).
+const quotaEgressRetries = 3
+
+// The retry-on-another-exit loop needs a total-time bound as well as an attempt
+// count: a per-attempt count alone lets a stalling exit burn a whole attempt
+// each round, so 3 retries can still mean minutes of waiting.
+//
+// The bound depends on WHICH failure is being retried, because the two classes
+// answer on completely different time scales:
+//
+//   - A 429 is a fast refusal (well under a second), so all three retries fit
+//     comfortably in a few seconds.
+//   - A transport failure or an upstream 5xx is a SLOW failure: measured here at
+//     30-90s per attempt. A single budget sized for 429s therefore expires
+//     before the first retry can even start, and the loop silently degrades to
+//     attempts=1 — which is what it did on a real install, returning 502 after
+//     93 seconds while healthy exits sat idle.
+//
+// So the budget is per class. Slow failures get enough room for the retries to
+// actually happen, and the attempt count still caps how many.
+const quotaEgressTotalMS = 40000
+
+// slowEgressTotalMS is the budget for the exit-shaped slow failures. It has to
+// clear at least one full attempt (the response-header timeout) plus room for a
+// retry, or the retry never runs.
+const slowEgressTotalMS = 210000
+
 // Complete runs one logical turn: effort budgeting, wire encoding, the
 // fingerprint gate, streaming decode, and — for a cut pure-reasoning turn —
 // one bounded checkpoint recovery request.
 // Complete runs one logical turn. When the requested model is rate-limited or
 // otherwise refuses before anything was streamed, it switches to the next
-// available model — the dsh lesson is that a 429 must never be retried on the
-// same model (quota is accounted per session; a retry is a second burn), so
-// switching is the only honest lever.
+// available model — a 429 must never be retried on the same model (quota is
+// accounted per session; a retry is a second burn), so switching is the only
+// honest lever.
 func (l *Lane) Complete(ctx context.Context, req Request, emit func(Chunk)) (Outcome, *UpstreamError) {
+	// Concurrency gate: wait here when saturated (the caller can still cancel).
+	select {
+	case upstreamSem <- struct{}{}:
+		defer func() { <-upstreamSem }()
+	case <-ctx.Done():
+		return Outcome{}, &UpstreamError{Code: CodeAborted, Message: "cancelled"}
+	}
+
 	effort := req.Effort
 	if effort == "" {
 		effort = EffortOf(req.Model)
@@ -456,6 +1046,10 @@ func (l *Lane) Complete(ctx context.Context, req Request, emit func(Chunk)) (Out
 
 	model := requested
 	failovers := 0
+	egressTries := 0
+	// The deadline is per attempt: each round gets the budget its own failure
+	// class deserves, rather than one bound fixed before we knew what failed.
+	egressDeadline := time.Now().Add(quotaEgressTotalMS * time.Millisecond)
 	tried := map[string]bool{requested: true}
 	for {
 		out, uerr, sawAny := l.attemptModel(ctx, req, model, effort, emit)
@@ -464,13 +1058,33 @@ func (l *Lane) Complete(ctx context.Context, req Request, emit func(Chunk)) (Out
 		if uerr == nil {
 			return out, nil
 		}
+		// Under rotation a 429 is one exit's answer, not the model's: quota is
+		// counted per egress IP and a funded exit may be two hops away, so ask
+		// the pool a few times before believing it. Every retry is a fresh dial
+		// (rotate disables keep-alives) and the node round-robin moves on.
+		// Slow failures get their own budget: a retry that cannot start inside the
+		// 429-sized window would otherwise be skipped, leaving attempts=1.
+		if egressRetryable(uerr.Code) && !sawAny && RotationActive() && egressTries < quotaEgressRetries &&
+			time.Now().Before(egressDeadline.Add(egressBudgetFor(uerr.Code))) {
+			egressTries++
+			continue
+		}
+		if uerr.Code == CodeQuota {
+			l.MarkThrottled(model, uerr.RetryAfter)
+		}
 		// No switch after content reached the caller (it would duplicate
 		// output), on egress-wide failures, or when the caller's own model
 		// error can't plausibly be answered by another model.
 		if !failover || sawAny || !switchableFailure(uerr) {
 			return out, uerr
 		}
-		next := l.nextCandidate(req.Needs, tried)
+		next := l.nextSameModel(req.Needs, model, tried, req.Needs.PromptTokens)
+		if next == "" {
+			// No same-model channel left: fall back to the old behaviour of
+			// switching to whatever model can answer. That changes the model
+			// the user asked for, so it stays the second choice.
+			next = l.nextCandidate(req.Needs, tried)
+		}
 		if next == "" {
 			// The lane has nothing left to offer this request — tell the
 			// gateway so it can (optionally) offer the turn to user-added
@@ -492,9 +1106,49 @@ func (l *Lane) Complete(ctx context.Context, req Request, emit func(Chunk)) (Out
 // switchableFailure reports whether this failure class can plausibly be
 // answered by a different model. Transport/credential faults are egress-wide —
 // switching models would just pay latency for the same refusal.
+// egressRetryable reports whether the same model is worth asking again through
+// a DIFFERENT exit. Quota is the original case (a 429 is one IP's answer, not
+// the model's), but a transport failure or an upstream 5xx is just as
+// exit-shaped: the request never got an answer, so asking another exit costs
+// nothing and can turn a 502 into a 200. Before this, only CodeQuota retried,
+// so a single stalling exit failed the turn while the rest of the pool idled.
+// CodeRegion belongs here too, and it was measured rather than reasoned: the
+// upstream refusal reads "not available in your country", i.e. it is a verdict
+// about the exit IP's country, not about the model. On a rotating pool that
+// mixes regions, cat-jam-free answered 200 at 14:28:57 and REGION_BLOCKED at
+// 14:31:10 with nothing changed but the chosen exit, and a six-request burst
+// right after came back 6/6 200. Treating it as deterministic left those turns
+// as a 403 to the caller with a pool of healthy exits idle. ReportExit already
+// books the (exit, model) pair, so the retry moves on instead of re-picking the
+// same blocked country.
+//
+// egressBudgetFor is the extra time this failure class may spend retrying
+// before the loop gives up. 429s need almost none; slow failures need a full
+// attempt's worth, because their per-attempt cost IS the reason they failed.
+func egressBudgetFor(code string) time.Duration {
+	switch code {
+	case CodeQuota:
+		return 0
+	}
+	return slowEgressTotalMS * time.Millisecond
+}
+
+func egressRetryable(code string) bool {
+	switch code {
+	case CodeQuota, CodeRegion, CodeTransport, CodeServer, CodeTimeout, CodeReset:
+		return true
+	}
+	return false
+}
+
+// A failure another model can plausibly answer. CodeTransport belongs here:
+// the transport error is an egress-shaped failure, not a verdict about this
+// model, and leaving it out meant a single stalled exit returned 502 to the
+// user while a dozen other exits sat idle — observed at 217 seconds of
+// waiting for one request, attempts=1.
 func switchableFailure(uerr *UpstreamError) bool {
 	switch uerr.Code {
-	case CodeQuota, CodeRegion, CodeServer, CodeTimeout, CodeEmpty:
+	case CodeQuota, CodeRegion, CodeFreeTier, CodeServer, CodeTimeout, CodeEmpty, CodeTransport, CodeReset:
 		return true
 	}
 	return false
@@ -516,6 +1170,72 @@ func (l *Lane) Candidates(needs Needs, exclude string, n int) []string {
 	return out
 }
 
+// nextSameModel returns another channel that serves the SAME model, when the
+// catalog holds one. Failover prefers this over switching models: a throttled
+// OpenCode Zen twin can be answered by the WorkBuddy pool without changing what
+// the user asked for, which is the whole point of grouping cross-channel twins.
+//
+// It returns "" when the model has no twin (the common case: most ids live on
+// one channel), is not the model the caller actually requested, or every twin is
+// throttled, unavailable, or too small for this request — the caller then falls
+// back to nextCandidate and the pre-existing behaviour.
+//
+// ⚠️ The group is keyed on the *served* id, not the requested one: a failover
+// already moved to another model, and looking up the original id would let a
+// two-hop chain bounce between models.
+func (l *Lane) nextSameModel(needs Needs, servedModel string, tried map[string]bool, promptTokens int) string {
+	l.mu.RLock()
+	groups := AggregateGroups(l.catalog)
+	throttle := l.throttle
+	availability := make(map[string]ProbeResult, len(l.availability))
+	for k, v := range l.availability {
+		availability[k] = v
+	}
+	smart := l.smartRouting
+	l.mu.RUnlock()
+
+	group := groups[servedModel]
+	if group == nil {
+		return ""
+	}
+	for _, id := range aggregateAlternates(group, servedModel, promptTokens, tried) {
+		if throttle.Throttled(id) {
+			continue
+		}
+		switch FreshState(availability[id]) {
+		case StateUnavailable, StateRegionBlock:
+			continue
+		}
+		if smart {
+			if m, ok := l.modelByID(id); ok {
+				if needs.Image && !m.Vision {
+					continue
+				}
+				if needs.Audio && !m.AudioInput {
+					continue
+				}
+				if needs.File && !m.FileInput {
+					continue
+				}
+			}
+		}
+		return id
+	}
+	return ""
+}
+
+// modelByID reads one catalog row.
+func (l *Lane) modelByID(id string) (ModelInfo, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	for _, m := range l.catalog {
+		if m.ID == id {
+			return m, true
+		}
+	}
+	return ModelInfo{}, false
+}
+
 // nextCandidate picks the best failover target: probed-available models
 // first, then unprobed ones; throttled, region-blocked, unavailable, decision
 // models and already-tried ids are skipped. With smart routing on, candidates
@@ -524,8 +1244,16 @@ func (l *Lane) Candidates(needs Needs, exclude string, n int) []string {
 // off, or with the catalog strategy, ties keep catalog order.
 func (l *Lane) nextCandidate(needs Needs, tried map[string]bool) string {
 	l.mu.RLock()
-	cat := make([]ModelInfo, len(l.catalog))
-	copy(cat, l.catalog)
+	cat := make([]ModelInfo, 0, len(l.catalog))
+	for _, m := range l.catalog {
+		// 用户取消勾选的模型不做 failover 候选：换过去等于把它重新变成
+		// 限流切换的目标，正是取消勾选想避免的 (#103)。显式点名仍然可达，
+		// attemptModel 直接查目录，不经过这里。
+		if l.hidden[m.ID] {
+			continue
+		}
+		cat = append(cat, m)
+	}
 	av := make(map[string]ProbeResult, len(l.availability))
 	for k, v := range l.availability {
 		av[k] = v
@@ -543,7 +1271,7 @@ func (l *Lane) nextCandidate(needs Needs, tried map[string]bool) string {
 		if tried[m.ID] || l.throttle.Throttled(m.ID) {
 			continue
 		}
-		switch av[m.ID].State {
+		switch FreshState(av[m.ID]) {
 		case StateUnavailable, StateRegionBlock:
 			continue
 		}
@@ -551,7 +1279,13 @@ func (l *Lane) nextCandidate(needs Needs, tried map[string]bool) string {
 			if !satisfiesNeeds(m, needs) {
 				continue
 			}
-			if needs.PromptTokens > 0 && m.ContextWindow > 0 && needs.PromptTokens > m.ContextWindow {
+			// The curated window is a measured floor (the probe stops at the
+			// first size it did not try, not the true ceiling), so widen it
+			// before excluding a candidate: a request slightly over the table
+			// value is far more likely to fit than to overflow, and letting
+			// the upstream be the judge costs one turn, while dropping the
+			// model silently costs the whole request.
+			if window := applyHeadroom(m.ContextWindow); needs.PromptTokens > 0 && window > 0 && needs.PromptTokens > window {
 				continue
 			}
 		}
@@ -571,14 +1305,29 @@ func (l *Lane) attemptModel(ctx context.Context, req Request, model, effort stri
 	base := model
 
 	l.mu.RLock()
+	defMax := l.defaultMaxTokens
 	var entry *ModelInfo
+	// One id can be published by two channel buckets at once (a rotation
+	// mirrors ids across the Zen lane and the Kilo pool). Catalog order says
+	// nothing about which copy is healthy right now, and the caller asked for
+	// this MODEL — the channel is an implementation detail — so among same-id
+	// copies prefer one whose probe verdict is usable, then the fastest first
+	// token, then catalog order.
+	var matches []*ModelInfo
 	for i := range l.catalog {
 		if l.catalog[i].ID == base {
-			entry = &l.catalog[i]
-			break
+			matches = append(matches, &l.catalog[i])
 		}
 	}
-	defMax := l.defaultMaxTokens
+	if len(matches) > 0 {
+		entry = matches[0]
+		best := channelCopyRank(entry, l.availability)
+		for _, m := range matches[1:] {
+			if r := channelCopyRank(m, l.availability); r < best {
+				entry, best = m, r
+			}
+		}
+	}
 	l.mu.RUnlock()
 	if entry == nil {
 		entry = &ModelInfo{ID: base, Name: base, Wire: WireFor(base),
@@ -587,7 +1336,7 @@ func (l *Lane) attemptModel(ctx context.Context, req Request, model, effort stri
 
 	if entry.SystemOne || entry.Wire == "systemone" {
 		return Outcome{}, &UpstreamError{Code: CodeServer,
-			Message: base + " is a System One decision model: it answers typed questions on /zen/v1/systemone, not chat requests"}, false
+			Message: base + " is a System One decision model: it answers typed questions on /inference/v1/systemone, not chat requests"}, false
 	}
 
 	budget := BudgetFor(effort, *entry, req.MaxTokens, defMax)
@@ -595,8 +1344,39 @@ func (l *Lane) attemptModel(ctx context.Context, req Request, model, effort stri
 	wire := entry.Wire
 	style := mapWireStyle(wire)
 
+	// Choose the exit before the request is built, then derive the upstream
+	// session from the exit's stable identity. Doing it in this order is what
+	// makes one conversation one exit: the same prompt prefix keeps landing on
+	// the same egress, so the upstream has a chance to reuse its prompt cache
+	// instead of re-prefilling the whole conversation on every turn.
+	plan := ExitPlan{Model: base}
+	if r := CurrentRotator(); r != nil {
+		plan.NodeID = r.Pick(req.SessionSeed, base)
+		plan.ExitKey = r.ExitKey(plan.NodeID)
+	}
+	ctx = WithExitPlan(ctx, plan)
+
+	// The Zen lane fingerprints tools and mints session/request ids; the Kilo
+	// pool has no tool-name gate and no session concept — its models see the
+	// caller's tools exactly as declared, and a plain POST per turn. The
+	// WorkBuddy channel is like Kilo on the fingerprint front (its identity
+	// headers are account-derived, not session-minted) but carries its own
+	// account credential and body quirks. CodeArts is likewise fingerprint-
+	// free (an OpenAI-compatible endpoint) but keys on a per-conversation chat
+	// id and demands the canonical (case-sensitive) registered model name.
+	kilo := entry.Channel == ChannelKilo
+	wb := entry.Channel == ChannelWorkBuddy
+	ca := entry.Channel == ChannelCodeArts
+	zc := entry.Channel == ChannelZCode
+	baseRequested := base
+	if ca {
+		// CodeArts matches registered names case-sensitively; the catalog row
+		// may carry a lowercase alias the user typed, so resolve it to the
+		// exact id before building the body.
+		baseRequested = caCanonicalModel(base)
+	}
 	buildBody := func(msgs []Message, tools []ToolDef, maxTokens int) map[string]any {
-		body := map[string]any{"model": base, "stream": true}
+		body := map[string]any{"model": baseRequested, "stream": true}
 		switch wire {
 		case "responses":
 			instructions, items := ToResponseInput(msgs)
@@ -627,18 +1407,87 @@ func (l *Lane) attemptModel(ctx context.Context, req Request, model, effort stri
 				body["tools"] = t
 			}
 		}
+		// Kilo's thinking control is the effort field itself, not a token
+		// ladder: the selected rung rides the request as the pool's own
+		// reasoning effort (light→low, balanced→medium, deep→high), verified
+		// against the families the pool honours. max_tokens still caps output.
+		if kilo && entry.Reasoning {
+			body["reasoning"] = map[string]any{"effort": kiloEffortRung(effort)}
+		}
+		// WorkBuddy: usage-bearing streams, per-family thinking fields, and
+		// the reasoning_content backfill the upstream demands on assistant
+		// turns once thinking is enabled.
+		if wb {
+			wbApplyModelQuirks(body, base, effort)
+			wbBackfillReasoning(body)
+		}
+		// ZCode speaks the Anthropic messages shape but with its own envelope:
+		// identity block first in `system`, effort in `output_config.effort`.
+		// Both are applied in zcodeBuildBody, which the post path calls — the
+		// body built here is the caller's shape only.
 		return body
 	}
 
-	session := SessionForConversation(req.SessionSeed)
+	// The Zen lane fingerprints tools and mints session/request ids; the Kilo
+	// pool has no tool-name gate and no session concept — its models see the
+	// caller's tools exactly as declared, and a plain POST per turn.
+	session := SessionForExit(req.SessionSeed, plan.ExitKey)
 	requestID := RequestIdFor(session, req.TurnSeed)
+	caChatID := caChatID(req.SessionSeed)
+	post := func(cctx context.Context, body map[string]any, onData func(payload []byte) error) (*Usage, error) {
+		if wb {
+			// One downstream conversation keeps one upstream conversation id
+			// (prompt cache), and the gate sees the id it fingerprints for.
+			return l.wbPost(cctx, body, wbConversationID(req.SessionSeed), onData)
+		}
+		if ca {
+			// Same discipline: one conversation, one 32-hex chat id, so the
+			// upstream's prompt cache holds across the conversation's turns.
+			return l.caPost(cctx, body, caChatID, onData)
+		}
+		if kilo {
+			return PostKiloStreamed(cctx, body, onData)
+		}
+		if zc {
+			return l.zcodePost(cctx, body, onData)
+		}
+		if entry.Channel == ChannelTrae {
+			return l.traePost(cctx, body, onData)
+		}
+		if p, ok := extPresets[entry.Channel]; ok {
+			return l.extPost(cctx, p, body, effort, onData)
+		}
+		return PostStreamed(cctx, EndpointFor(base), body, session, requestID, onData)
+	}
 
 	body := buildBody(messages, req.Tools, budget)
-	rename := ApplyFingerprint(body, style)
+	rename := map[string]string{}
+	if !kilo && !ca {
+		rename = ApplyFingerprint(body, style)
+	}
+	// Prompt-cache hints ride only the channels whose request shape we control
+	// end to end.
+	//
+	//   - Zen: byte-checked against the reference CLI (key order, exact tool
+	//     definitions). An extra top-level field draws 403 FreeTierError, so
+	//     nothing is added here.
+	//   - Kilo: no measured behaviour for this field at all.
+	//   - CodeArts: its own reference body builder has always sent the key
+	//     (`chatBodyV2`), and this lane is a plain OpenAI-compatible endpoint —
+	//     the request we build is the one that builder describes.
+	//   - WorkBuddy: measured on the reference plugin (8k prefix: 0 → 7808 hit
+	//     tokens, credit 0.34 → 0.02), but not yet on this lane, so it stays
+	//     behind a switch until a live A/B says the WAF accepts it.
+	if ca {
+		WithCacheKey(body, wire, caChatID)
+	}
+	if wb && l.workBuddyCacheKey() {
+		WithCacheKey(body, wire, wbConversationID(req.SessionSeed))
+	}
 
 	decoder := NewDecoder(wire, rename, emit)
 	var firstAt int64
-	usage, err := PostStreamed(ctx, EndpointFor(base), body, session, requestID, func(p []byte) error {
+	usage, err := post(ctx, body, func(p []byte) error {
 		if firstAt == 0 {
 			firstAt = time.Since(start).Milliseconds()
 		}
@@ -650,87 +1499,154 @@ func (l *Lane) attemptModel(ctx context.Context, req Request, model, effort stri
 		result.Usage = *usage
 	}
 	sawAny := result.SawText || result.SawToolCall || result.SawReasoning
-	l.record(CallRecord{Model: base, Ok: false, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, err, firstAt)
 
 	if err != nil {
-		uerr := asUpstream(err)
-		if uerr.Code == CodeQuota {
-			l.MarkThrottled(base, uerr.RetryAfter)
+		l.record(ctx, CallRecord{Model: base, Ok: false, Exit: plan.NodeID, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, err, firstAt)
+		// Book the failure against (exit, model) so later requests skip it. The
+		// ledger only ever skips known-bad pairs — it is never used to prefer a
+		// "known good" one, which would pin every concurrent request onto the
+		// first success and burn that exit's allowance.
+		switch asUpstream(err).Code {
+		case CodeRegion:
+			ReportExit(plan.NodeID, base, "region")
+		case CodeQuota:
+			ReportExit(plan.NodeID, base, "limited")
+		case CodeTransport, CodeTimeout, CodeReset:
+			ReportExit(plan.NodeID, base, "other")
+			// The tunnel itself died: book the node, not just the pair, so a
+			// node that "connects but every turn dies" leaves rotation after
+			// two strikes instead of poisoning one request at a time.
+			ReportDeadExit(plan.NodeID)
+		case CodeServer, CodeEmpty:
+			// The upstream answered — the tunnel works. Node health is not
+			// implicated; the (exit, model) pair is enough.
+			ReportExit(plan.NodeID, base, "other")
 		}
-		return Outcome{Finish: result.Finish}, uerr, sawAny
+		// The caller decides what a 429 means: under rotation it re-asks the
+		// pool before the model gets a throttle episode.
+		return Outcome{Finish: result.Finish}, asUpstream(err), sawAny
 	}
 	if result.SawFinish {
-		l.MarkOK(base)
-		l.record(CallRecord{Model: base, Ok: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, nil, firstAt)
+		switch result.FinishToken {
+		case "failed", "cancelled":
+			// A terminal frame that names the turn a failure is not a clean
+			// stop, even though the mapped reason collapses into stop.
+			l.record(ctx, CallRecord{Model: base, Ok: false, Exit: plan.NodeID, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, nil, firstAt)
+			return Outcome{Usage: result.Usage}, &UpstreamError{Code: CodeServer,
+				Message: "upstream ended the turn with " + result.FinishToken}, sawAny
+		}
+		l.NoteRealSuccess(base)
+		// A served request is proof: clear this exit's cooldown and the ban
+		// booked against this very (exit, model) pair.
+		if r := CurrentRotator(); r != nil && plan.NodeID != "" {
+			r.Revive(plan.NodeID, base)
+		}
+		l.record(ctx, CallRecord{Model: base, Ok: true, Exit: plan.NodeID, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, nil, firstAt)
 		return Outcome{Usage: result.Usage, Finish: result.Finish}, nil, true
 	}
 
-	// Cut stream. Retry only a pure-reasoning cut that produced nothing else —
-	// a mid-content cut is a property of this turn's length, and re-sending
-	// would pay the same five minutes again.
+	// Ending without its answer. Three shapes get one continuation each —
+	// a cut pure-reasoning turn (no finish), a clean stop that carried only
+	// thinking, and an answer truncated at the output ceiling — everything
+	// else reports honestly.
 	elapsed := time.Since(start).Milliseconds()
-	if !canRecover(result, elapsed) {
-		l.record(CallRecord{Model: base, Ok: false, Truncated: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, nil, firstAt)
-		return Outcome{Usage: result.Usage}, &UpstreamError{Code: CodeTransport, Message: "upstream closed the stream without a finish token"}, sawAny
-	}
+	interrupted := canRecover(result, elapsed)
+	silentStop := !interrupted && canRecoverSilentStop(result, elapsed)
+	maxTokensCut := !interrupted && !silentStop && canContinueFromCut(result, elapsed)
 
-	recovBudget := min2(RecoveryMaxOutputTokens, budget-result.Usage.Output)
-	if recovBudget < 512 || !checkpointFits(messages, *entry, result.ReasoningText, recovBudget) {
-		l.record(CallRecord{Model: base, Ok: false, Truncated: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, nil, firstAt)
-		return Outcome{Usage: result.Usage}, &UpstreamError{Code: CodeTransport, Message: "upstream cut a pure-reasoning turn; recovery does not fit the context"}, sawAny
-	}
-	recMsgs := append(append([]Message{}, messages...), Message{Role: RoleUser, Parts: []Part{
-		TextPart{Text: recoveryInstruction + jsonString(result.ReasoningText)},
-	}})
-	recBody := buildBody(recMsgs, nil, recovBudget)
-	ApplyFingerprint(recBody, style)
-	recDecoder := NewDecoder(wire, rename, emit)
-	remaining := RecoveryTotalTimeoutMS - elapsed
-	if remaining > RecoveryMaxContinuationMS {
-		remaining = RecoveryMaxContinuationMS
-	}
-	rctx, cancel := context.WithTimeout(ctx, time.Duration(remaining)*time.Millisecond)
-	defer cancel()
-
-	recUsage, rerr := PostStreamed(rctx, EndpointFor(base), recBody, session, RequestIdFor(session, req.TurnSeed+":recovery"), func(p []byte) error {
-		recDecoder.Decode(p)
-		return nil
-	})
-	recResult := recDecoder.Finish()
-	if recUsage != nil && recResult.Usage.TotalTokens == 0 {
-		recResult.Usage = *recUsage
-	}
-	if rerr == nil && recResult.SawFinish && recResult.Finish == FinishStop && recResult.SawText {
-		recResult.Usage.Merge(&result.Usage)
-		l.MarkOK(base)
-		l.record(CallRecord{Model: base, Ok: true, Recovered: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, recResult, nil, firstAt)
-		return Outcome{Usage: recResult.Usage, Finish: recResult.Finish, Recovered: true}, nil, true
-	}
-	recResult.Usage.Merge(&result.Usage)
-	l.record(CallRecord{Model: base, Ok: false, Truncated: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, recResult, rerr, firstAt)
-	if rerr != nil {
-		uerr := asUpstream(rerr)
-		if uerr.Code == CodeQuota {
-			l.MarkThrottled(base, uerr.RetryAfter)
+	if interrupted || silentStop || maxTokensCut {
+		remaining := budget - result.Usage.Output
+		recovBudget := min2(RecoveryMaxOutputTokens, remaining)
+		checkpoint := result.ReasoningText
+		var recMsgs []Message
+		if maxTokensCut {
+			// The partial answer is already valid assistant output; the wire's
+			// own history carries it, no checkpoint injection.
+			recMsgs = append(append([]Message{}, messages...),
+				Message{Role: RoleAssistant, Parts: []Part{TextPart{Text: result.AnswerText}}},
+				Message{Role: RoleUser, Parts: []Part{TextPart{Text: continuationInstruction}}})
+			checkpoint = result.AnswerText
+		} else {
+			recMsgs = append(append([]Message{}, messages...), Message{Role: RoleUser, Parts: []Part{
+				TextPart{Text: recoveryInstruction + jsonString(result.ReasoningText)},
+			}})
 		}
-		return Outcome{Usage: recResult.Usage}, uerr, true
-	}
-	return Outcome{Usage: recResult.Usage}, &UpstreamError{Code: CodeTransport, Message: "upstream cut the stream; recovery did not complete"}, true
-}
+		if recovBudget < 512 || !checkpointFits(recMsgs, *entry, checkpoint, recovBudget) {
+			l.record(ctx, CallRecord{Model: base, Ok: false, Truncated: true, Exit: plan.NodeID, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, nil, firstAt)
+			return Outcome{Usage: result.Usage}, &UpstreamError{Code: CodeTransport, Message: "upstream cut a turn short; the continuation does not fit the context"}, sawAny
+		}
+		recBody := buildBody(recMsgs, nil, recovBudget)
+		if !kilo {
+			ApplyFingerprint(recBody, style)
+		}
+		recDecoder := NewDecoder(wire, rename, emit)
+		// The continuation deadline is the remainder of the turn's window —
+		// whatever the first segment left, at most.
+		remainingWall := RecoveryTotalTimeoutMS - elapsed
+		if remainingWall > RecoveryMaxContinuationMS {
+			remainingWall = RecoveryMaxContinuationMS
+		}
+		rctx, cancel := context.WithTimeout(ctx, time.Duration(remainingWall)*time.Millisecond)
+		defer cancel()
 
-func (l *Lane) record(rec CallRecord, result StreamResult, err error, firstAt int64) {
+		recUsage, rerr := post(rctx, recBody, func(p []byte) error {
+			recDecoder.Decode(p)
+			return nil
+		})
+		recResult := recDecoder.Finish()
+		if recUsage != nil && recResult.Usage.TotalTokens == 0 {
+			recResult.Usage = *recUsage
+		}
+		if rerr == nil && recResult.SawFinish && recResult.FinishToken != "failed" && recResult.FinishToken != "cancelled" && recResult.SawText {
+			recResult.Usage.Merge(&result.Usage)
+			l.NoteRealSuccess(base)
+			// The continuation rode the same exit and served: same proof as a
+			// clean turn, so lift this pair's cooldown/ban too.
+			if r := CurrentRotator(); r != nil && plan.NodeID != "" {
+				r.Revive(plan.NodeID, base)
+			}
+			l.record(ctx, CallRecord{Model: base, Ok: true, Recovered: true, Exit: plan.NodeID, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, recResult, nil, firstAt)
+			return Outcome{Usage: recResult.Usage, Finish: recResult.Finish, Recovered: true}, nil, true
+		}
+		recResult.Usage.Merge(&result.Usage)
+		l.record(ctx, CallRecord{Model: base, Ok: false, Truncated: true, Exit: plan.NodeID, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, recResult, rerr, firstAt)
+		if rerr != nil {
+			uerr := asUpstream(rerr)
+			if uerr.Code == CodeQuota {
+				l.MarkThrottled(base, uerr.RetryAfter)
+			}
+			return Outcome{Usage: recResult.Usage}, uerr, true
+		}
+		return Outcome{Usage: recResult.Usage}, &UpstreamError{Code: CodeTransport, Message: "upstream cut the stream; the continuation did not complete"}, true
+	}
+
+	// Not recoverable: a mid-content cut is a property of this turn's length,
+	// and re-sending would pay the same five minutes again.
+	l.record(ctx, CallRecord{Model: base, Ok: false, Truncated: true, Exit: plan.NodeID, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, nil, firstAt)
+	return Outcome{Usage: result.Usage}, &UpstreamError{Code: CodeTransport, Message: "upstream closed the stream without a finish token"}, sawAny
+}
+func (l *Lane) record(ctx context.Context, rec CallRecord, result StreamResult, err error, firstAt int64) {
 	if l.OnCall == nil {
 		return
+	}
+	rec.Trace = TraceFrom(ctx)
+	if ue := asUpstream(err); ue != nil {
+		rec.ErrCode = ue.Code
+		rec.UpstreamRID = ue.UpstreamRID
 	}
 	if err != nil {
 		rec.Ok = false
 	} else {
 		rec.Ok = result.SawFinish
 	}
-	rec.Input = result.Usage.Input
+	// Account the whole prompt, not just its uncached part: the day buckets and
+	// the access line both read this figure as "tokens sent", and an Anthropic
+	// upstream reports only the miss there.
+	rec.Input = result.Usage.InputTotal()
 	rec.Output = result.Usage.Output
 	rec.Reasoning = result.Usage.Reasoning
 	rec.CacheRead = result.Usage.CacheRead
+	rec.CacheWrite = result.Usage.CacheWrite
 	rec.TTFTMs = firstAt
 	if result.SawText {
 		rec.DecodeTok = WindowTokens(result.Usage, result.SawReasoning)
@@ -752,6 +1668,43 @@ func canRecover(result StreamResult, elapsedMS int64) bool {
 		!result.SawToolCall &&
 		!result.CheckpointTruncated &&
 		nonWhitespace(result.ReasoningText)
+}
+
+// canRecoverSilentStop: the upstream closed cleanly but produced only
+// thinking and no answer — most clients judge such a turn an empty response,
+// so it gets the same one checkpoint continuation a cut pure-reasoning turn
+// gets. The raw token decides "clean": the mapped Finish collapses unknown
+// spellings into stop, so failed/cancelled must be excluded here by token.
+func canRecoverSilentStop(result StreamResult, elapsedMS int64) bool {
+	if !result.SawFinish || elapsedMS >= RecoveryTotalTimeoutMS {
+		return false
+	}
+	switch result.FinishToken {
+	case "", "stop", "end_turn", "stop_sequence":
+	default:
+		return false
+	}
+	return result.SawReasoning &&
+		!result.SawText &&
+		!result.SawToolCall &&
+		!result.CheckpointTruncated &&
+		nonWhitespace(result.ReasoningText)
+}
+
+// canContinueFromCut: the answer hit the output ceiling (finish length) and
+// was cut mid-answer, not faulted. The partial answer feeds back as an
+// assistant turn and exactly one continuation with the remaining budget
+// replaces the client's manual "send 继续" relay. First segment only — a
+// continuation that hits the wall again reports max-tokens honestly instead
+// of continuing forever.
+func canContinueFromCut(result StreamResult, elapsedMS int64) bool {
+	return result.SawFinish &&
+		result.Finish == FinishMaxTokens &&
+		result.SawText &&
+		!result.SawToolCall &&
+		!result.BrokenToolCall &&
+		elapsedMS < RecoveryTotalTimeoutMS &&
+		nonWhitespace(result.AnswerText)
 }
 
 func nonWhitespace(s string) bool {
@@ -800,3 +1753,29 @@ func asUpstream(err error) *UpstreamError {
 	return &UpstreamError{Code: CodeTransport, Message: err.Error()}
 }
 
+// channelCopyRank orders same-id copies across channels: a usable probe
+// verdict first (available beats unknown beats throttled beats region-blocked
+// beats unavailable), then the faster first token, then catalog order.
+func channelCopyRank(m *ModelInfo, av map[string]ProbeResult) int {
+	score := 0
+	switch FreshState(av[m.ID]) {
+	case StateAvailable:
+		score = 0
+	case StateUnknown, "":
+		score = 1
+	case StateThrottled:
+		score = 2
+	case StateRegionBlock:
+		score = 3
+	default:
+		score = 4
+	}
+	ttft := av[m.ID].TTFTMs
+	if ttft < 0 {
+		ttft = 999_999_999
+	}
+	if ttft > 999_999_999 {
+		ttft = 999_999_999
+	}
+	return score*1_000_000_000 + int(ttft)
+}

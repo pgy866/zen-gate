@@ -1,9 +1,10 @@
-// Package lane speaks to the OpenCode Zen free lane (https://opencode.ai).
+// Package lane speaks to the OpenCode Zen free lane (https://opencode.ai) and
+// to the other keyless free sources the gateway aggregates.
 //
-// The wire behaviour ported here was reverse-engineered and documented by the
-// MIT-licensed dsh-our-free-model plugin (github.com/zouyuxuan122/dsh-our-free-model);
-// every constant and format matches that implementation so the two stay
-// interchangeable against the same gateway.
+// The wire behaviour here was settled against the live gateway: session
+// minting, the tool-name gate, the three wire protocols (chat / responses /
+// messages), and cut-stream recovery all reproduce what a genuine desktop
+// client sends, so models answer without a per-user key.
 package lane
 
 import (
@@ -24,6 +25,13 @@ type Part interface{ partMarker() }
 
 // TextPart is plain text.
 type TextPart struct{ Text string }
+
+// ReasoningPart is the thinking an assistant turn produced, as the client
+// replayed it. DeepSeek-family thinking mode rejects a replayed assistant turn
+// whose reasoning_content was dropped ("The `reasoning_content` in the thinking
+// mode must be passed back to the API"), so the text is carried through the
+// unified model and put back on the chat wire (issue #99).
+type ReasoningPart struct{ Text string }
 
 // ImagePart is an image carried as a data URL ("data:image/png;base64,…").
 type ImagePart struct{ DataURL string }
@@ -58,6 +66,7 @@ type ToolResultPart struct {
 }
 
 func (TextPart) partMarker()       {}
+func (ReasoningPart) partMarker()  {}
 func (ImagePart) partMarker()      {}
 func (AudioPart) partMarker()      {}
 func (FilePart) partMarker()       {}
@@ -89,6 +98,22 @@ type ToolDef struct {
 }
 
 // Usage is one call's token accounting.
+//
+// Input and CacheRead are both raw upstream numbers, kept apart on purpose:
+// the two protocol families disagree about what "input" means, and collapsing
+// them at parse time throws away the only evidence of which family answered.
+//
+//   - OpenAI's prompt_tokens ALREADY includes cached tokens, so Input contains
+//     CacheRead (CacheInclusive).
+//   - Anthropic's input_tokens EXCLUDE cached tokens, so Input is the fresh
+//     part only.
+//
+// CacheInclusive records which one this figure came from. Every outbound
+// protocol needs the same underlying number, so nothing outside this file may
+// add the two fields up by hand: call InputTotal (all prompt tokens, cached or
+// not) or InputFresh (the uncached part). Adding them naively double-counted
+// every OpenAI-family turn — a 166k-token prompt with a 165k cache hit was
+// reported to clients as 332k input.
 type Usage struct {
 	Input       int `json:"input"`
 	Output      int `json:"output"`
@@ -96,6 +121,31 @@ type Usage struct {
 	CacheRead   int `json:"cacheRead,omitempty"`
 	CacheWrite  int `json:"cacheWrite,omitempty"`
 	TotalTokens int `json:"totalTokens,omitempty"`
+	// CacheInclusive says Input already contains CacheRead. Never serialized:
+	// it describes where the number came from, not how much was spent.
+	CacheInclusive bool `json:"-"`
+}
+
+// InputTotal is every prompt token the model saw, cached and uncached alike.
+// This is what an OpenAI-shaped client calls prompt_tokens.
+func (u Usage) InputTotal() int {
+	if u.CacheInclusive {
+		return u.Input
+	}
+	return u.Input + u.CacheRead
+}
+
+// InputFresh is the part of the prompt that missed the cache. This is what an
+// Anthropic-shaped client calls input_tokens; the hit portion travels in its
+// own cache_read_input_tokens field.
+func (u Usage) InputFresh() int {
+	fresh := u.InputTotal() - u.CacheRead
+	if fresh < 0 {
+		// An upstream that reports more cache hits than prompt tokens is
+		// stating something we cannot reconcile; never emit a negative count.
+		return 0
+	}
+	return fresh
 }
 
 // Finish reasons.
@@ -117,8 +167,7 @@ const (
 	ChunkFinish        = "finish"
 )
 
-// Chunk is a normalized stream piece, mirroring the harness StreamChunk shape
-// used by dsh-our-free-model.
+// Chunk is a normalized stream piece.
 type Chunk struct {
 	Kind      string
 	Index     int
@@ -190,8 +239,8 @@ type Request struct {
 	Agent       string // caller label for stats (main key → "")
 	// Needs describes the request's modality footprint; the failover
 	// candidate filter matches it against model capabilities.
-	Needs Needs
-	Context     context.Context
+	Needs   Needs
+	Context context.Context
 	// OnAttempt is called before each upstream attempt with the model about to
 	// be tried — including failover attempts. The gateway uses it to stamp the
 	// served-by header at first byte.
@@ -221,21 +270,81 @@ type UpstreamError struct {
 	// Unavailable marks a gateway refusal that names the model specifically.
 	Unavailable bool
 	RetryAfter  int // seconds, when the gateway supplied one
+	// HTTPStatus is the response status the classification came from, 0 when
+	// the failure was read out of a stream frame or a transport fault. Callers
+	// that must tell "the model refused this request" (400/422) apart from
+	// "nothing by that name exists" (404) read it.
+	HTTPStatus int
 	// Exhausted marks that the lane had no further failover candidate left —
 	// the gateway may offer this failure to user-added providers instead.
 	Exhausted bool
+	// UpstreamRID is the trace id the provider put on the response
+	// (x-request-id / request-id). It is the only handle the provider's
+	// support team can use to find a failed turn on their side.
+	UpstreamRID string
+	// Soft marks a credential refusal that is probably transient: the account
+	// stays in the pool, only a short cooldown applies, and repeated hits
+	// escalate to a real logout. WorkBuddy answers 12153 (and "Offline user
+	// session not found") for network hiccups and refresh races too, so one
+	// of those must not bench an account for good.
+	Soft bool
+	// Scope says how far a quota refusal reaches, which a pool must know: a
+	// per-model window (6004 names one model's reset clock) leaves the
+	// account's other models usable, while an account-level one (paid balance
+	// gone) takes everything down. Empty means "the model named in the
+	// request", which is the safe default — it never over-benches.
+	Scope string
 }
+
+// Refusal scopes. See UpstreamError.Scope.
+const (
+	ScopeModel   = "model"
+	ScopeAccount = "account"
+)
 
 func (e *UpstreamError) Error() string { return fmt.Sprintf("%s: %s", e.Code, e.Message) }
 
-// Classification codes, matching dsh-our-free-model's CODE table.
+// Classification codes for lane failures. CodeClient marks a refusal that is
+// the request's own fault (a WAF page, a 4xx the caller cannot fix by
+// re-sending): replaying the identical body reproduces the identical refusal,
+// so it stays outside the failover set.
 const (
 	CodeRegion     = "REGION_BLOCKED"
 	CodeQuota      = "RATE_LIMIT"
 	CodeCredential = "INVALID_CREDENTIAL"
 	CodeTransport  = "TRANSPORT"
+	CodeReset      = "TRANSPORT_RESET"
 	CodeTimeout    = "TIMEOUT"
 	CodeServer     = "SERVER"
+	CodeClient     = "CLIENT_ERROR"
 	CodeEmpty      = "EMPTY_RESPONSE"
 	CodeAborted    = "ABORTED"
+	// CodeFreeTier is the upstream free-tier gate refusing the whole lane
+	// ("free tier can only be used from within OpenCode"). It is its own code
+	// rather than a flavour of CodeRegion because the two need opposite
+	// treatment on the egress axis: a region block is a verdict about the exit
+	// IP's country, so another exit can answer it; this gate is decided before
+	// the request body is even read, so it lands on every exit identically and
+	// retrying them only burns the budget. Both stay switchable, which is what
+	// lets the turn fall through to the Kilo pool instead of surfacing as 401.
+	CodeFreeTier = "FREE_TIER_BLOCKED"
 )
+
+// traceKey carries the gateway's correlation id for one logical client request
+// into the lane, so every physical attempt (including failovers the client
+// never saw) can be reported back under the same id.
+type traceKey struct{}
+
+// WithTrace returns ctx carrying the request correlation id.
+func WithTrace(ctx context.Context, rid string) context.Context {
+	return context.WithValue(ctx, traceKey{}, rid)
+}
+
+// TraceFrom reads the correlation id, empty when the call was not made for a
+// client request (probes, background work).
+func TraceFrom(ctx context.Context) string {
+	if v, ok := ctx.Value(traceKey{}).(string); ok {
+		return v
+	}
+	return ""
+}

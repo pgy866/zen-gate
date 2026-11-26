@@ -8,6 +8,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
 
 	"zen-gate/internal/lane"
 	"zen-gate/internal/store"
@@ -43,11 +47,31 @@ type Agent interface {
 
 // Registry holds all adapters.
 type Registry struct {
-	agents      []Agent
-	st          *store.Store
+	agents []Agent
+	st     *store.Store
+	mu     sync.Mutex
+	// baseURL/modelsCache are written by SetEndpoints (main's syncEndpoints,
+	// which OnChange fires from lane goroutines) and read by ResyncEnabled —
+	// both can run off the UI goroutine, hence the mutex.
 	baseURL     string
 	modelsCache []lane.ModelInfo
+	// injectedKey fingerprints the model roster the enabled adapters were
+	// last written with; see ResyncEnabled.
+	injectedKey string
+	// views caches the last Detect pass. Detect shells out for a version on
+	// every installed agent, which costs a few hundred ms each — with 13
+	// adapters a /state poll took ~3s and the dashboard sat empty until it
+	// returned. Any Enable/Disable invalidates the cache, so a user action is
+	// visible on the very next poll.
+	viewsMu sync.Mutex
+	views   []View
+	viewsAt time.Time
 }
+
+// viewsTTL bounds how stale a Detect verdict may be. Detection itself only
+// changes when the user installs or removes something, so seconds of staleness
+// cost nothing while a fresh pass per request costs the first paint.
+const viewsTTL = 15 * time.Second
 
 // NewRegistry builds the built-in adapter set.
 func NewRegistry(st *store.Store) *Registry {
@@ -65,19 +89,54 @@ func NewRegistry(st *store.Store) *Registry {
 			newQwenCode(),
 			newContinueIDE(),
 			newWorkBuddy(),
+			newWorkBuddyAI(),
 			newQoder(),
+			newOpenHands(),
 		},
 	}
 }
 
 // SetEndpoints supplies the live base URL and model list (main wires this).
 func (r *Registry) SetEndpoints(baseURL string, models []lane.ModelInfo) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.baseURL = baseURL
 	r.modelsCache = models
 }
 
-// Views snapshots every adapter's state.
+// Views snapshots every adapter's state. The Detect pass is cached for
+// viewsTTL so the dashboard's 10s poll does not re-shell-out to every agent on
+// each tick; Enable/Disable drop the cache instead of relying on the TTL.
 func (r *Registry) Views() []View {
+	r.viewsMu.Lock()
+	if r.views != nil && time.Since(r.viewsAt) < viewsTTL {
+		out := make([]View, len(r.views))
+		copy(out, r.views)
+		r.viewsMu.Unlock()
+		return out
+	}
+	r.viewsMu.Unlock()
+
+	out := r.detectViews()
+
+	r.viewsMu.Lock()
+	r.views, r.viewsAt = out, time.Now()
+	r.viewsMu.Unlock()
+
+	cp := make([]View, len(out))
+	copy(cp, out)
+	return cp
+}
+
+// dropViews invalidates the Detect cache after a state change.
+func (r *Registry) dropViews() {
+	r.viewsMu.Lock()
+	r.views = nil
+	r.viewsAt = time.Time{}
+	r.viewsMu.Unlock()
+}
+
+func (r *Registry) detectViews() []View {
 	out := []View{}
 	for _, a := range r.agents {
 		id, name, describe := a.Meta()
@@ -106,6 +165,9 @@ func (r *Registry) Views() []View {
 		if installed && id == "workbuddy" && processRunning("WorkBuddy") {
 			v.Warn = "WorkBuddy 正在运行，配置保存后约 1 秒自动热加载，无需重启"
 		}
+		if installed && id == "workbuddy-ai" && processRunning("WorkBuddy AI") {
+			v.Warn = "WorkBuddy AI 正在运行，配置保存后约 1 秒自动热加载，无需重启"
+		}
 		if installed && id == "qoder" && processRunning("Qoder CN", "Qoder") {
 			v.Warn = "Qoder 正在运行，若模型列表未刷新请重启 Qoder 生效"
 		}
@@ -120,11 +182,21 @@ func (r *Registry) Enable(id string) error {
 	if !ok {
 		return fmt.Errorf("unknown agent %q", id)
 	}
-	if err := a.Enable(r.options()); err != nil {
+	opts, key := r.snapshot()
+	if err := a.Enable(opts); err != nil {
 		return err
 	}
-	r.st.Config().EnabledAgents[id] = true
+	// The manual enable just wrote the current list; record that so a Resync
+	// of the same content does not stack a second backup for nothing.
+	r.commit(key)
+	r.st.Mutate(func(cfg *store.Config) {
+		if cfg.EnabledAgents == nil {
+			cfg.EnabledAgents = map[string]bool{}
+		}
+		cfg.EnabledAgents[id] = true
+	})
 	_ = r.st.Save()
+	r.dropViews()
 	return nil
 }
 
@@ -135,26 +207,55 @@ func (r *Registry) Disable(id string) error {
 		return fmt.Errorf("unknown agent %q", id)
 	}
 	err := a.Disable()
-	r.st.Config().EnabledAgents[id] = false
+	if err == nil {
+		// Nothing is injected now; reset the fingerprint so the next Enable
+		// of the same list still writes instead of reading "unchanged".
+		r.commit("")
+	}
+	r.st.Mutate(func(cfg *store.Config) {
+		if cfg.EnabledAgents == nil {
+			cfg.EnabledAgents = map[string]bool{}
+		}
+		cfg.EnabledAgents[id] = false
+	})
 	_ = r.st.Save()
+	r.dropViews()
 	return err
 }
 
 // ResyncEnabled re-injects the config of every enabled adapter with the
-// current model list. Run after the user changes model visibility so agent
-// pickers follow without toggling each adapter by hand; adapters back up and
-// write atomically, so a repeat Enable is safe.
+// current model list — but only when that list changed since the last
+// successful pass. main wires it into OnChange (issue #26: a model joining
+// the catalog never reached any agent config), and OnChange fires on every
+// probe round; without the fingerprint gate, every idle round would rewrite
+// every enabled agent and stack another timestamped backup — backups are
+// never pruned. Adapters back up and write atomically, so a repeat Enable of
+// the same content is harmless but wasteful; the gate makes it a no-op.
 func (r *Registry) ResyncEnabled() int {
-	n := 0
+	opts, key := r.snapshot()
+	if key == r.currentKey() {
+		return 0
+	}
+	var attempted, done int
 	for _, a := range r.agents {
 		if enabled, _, err := a.IsEnabled(); err != nil || !enabled {
 			continue
 		}
-		if err := a.Enable(r.options()); err == nil {
-			n++
+		attempted++
+		if err := a.Enable(opts); err == nil {
+			done++
 		}
 	}
-	return n
+	// Commit only when every enabled adapter took the write: a partial pass
+	// must retry the whole list next round, or a failing agent would sit on
+	// stale content forever behind the fingerprint.
+	if done == attempted {
+		r.commit(key)
+	}
+	if done > 0 {
+		r.dropViews()
+	}
+	return done
 }
 
 func (r *Registry) byID(id string) (Agent, bool) {
@@ -166,17 +267,66 @@ func (r *Registry) byID(id string) (Agent, bool) {
 	return nil, false
 }
 
-func (r *Registry) options() Options {
+// snapshot returns the current injection options plus a fingerprint of
+// everything they are made of (base URL and per-model id/context/max-output/
+// reasoning/modalities — exactly what the injected files carry). Both derive
+// from one locked read so a caller can compare against the previous key and
+// later write the same content without a window where the cache shifted.
+// Models sort by id before fingerprinting: the picker order is the upstream
+// listing order and can include transient availability wobble, and a
+// reorder-only roster writes byte-identical content — committing on it would
+// freeze out a later genuine change that sorts into the same prefix.
+func (r *Registry) snapshot() (Options, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	def := ""
 	if len(r.modelsCache) > 0 {
 		def = r.modelsCache[0].ID
+		// The user's chosen default outranks list order - but only when it
+		// names a model the roster actually carries, otherwise a stale pick
+		// (hidden, retired, channel off) silently injects a dead default.
+		if want := strings.TrimSpace(r.st.Config().DefaultModel); want != "" {
+			for _, m := range r.modelsCache {
+				if m.ID == want {
+					def = want
+					break
+				}
+			}
+		}
 	}
-	return Options{
+	sorted := make([]lane.ModelInfo, len(r.modelsCache))
+	copy(sorted, r.modelsCache)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
+	var b strings.Builder
+	b.WriteString(r.baseURL)
+	for _, m := range sorted {
+		fmt.Fprintf(&b, "\x00%s|%d|%d|%v|%v|%v|%v", m.ID, m.ContextWindow, m.MaxOutput, m.Reasoning, m.Vision, m.AudioInput, m.FileInput)
+	}
+	o := Options{
 		BaseURL:      r.baseURL,
 		APIKey:       r.st.Config().MainKey,
 		Models:       r.modelsCache,
 		DefaultModel: def,
 	}
+	// The chosen default is part of the injected content (ANTHROPIC_MODEL and
+	// friends): fingerprint it too, or changing only the default looks like
+	// "nothing changed" and the old default stays in every config file.
+	fmt.Fprintf(&b, "\x00def=%s", def)
+	return o, b.String()
+}
+
+// currentKey reads the last committed fingerprint under the registry lock.
+func (r *Registry) currentKey() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.injectedKey
+}
+
+// commit records that the enabled adapters now hold exactly this fingerprint.
+func (r *Registry) commit(key string) {
+	r.mu.Lock()
+	r.injectedKey = key
+	r.mu.Unlock()
 }
 
 // --- shared helpers ----------------------------------------------------------

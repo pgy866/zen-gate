@@ -20,18 +20,48 @@ const probeTimeout = 12 * time.Second
 // coolDuration parks a node after a dial failure before it rejoins rotation.
 const coolDuration = time.Minute
 
+// probeNodeRoundtrips is how many tries one node gets before it is judged dead.
+// ProbeAll's verdict is a sample, and a sample is cheap to get wrong: transient
+// jitter, upstream rate limits and local port contention all read as "egress
+// empty" on the first try, and a false death drops a healthy node out of the
+// pool until the next probe. One re-try on a fresh connection clears those.
+const probeNodeRoundtrips = 2
+
 // ProbeAll health-checks every node concurrently: egress IP/country via the
 // node's local socks inbound, latency from the echo round-trip. Nodes that
 // fail lose their Alive flag and drop out of rotation until the next probe.
+// realTrafficTrust is how long a real success keeps a node out of the probe
+// rotation. A probe is a sample that can be wrong in both directions; a served
+// request is proof, so re-sampling that node spends probe budget to risk
+// overwriting a better verdict. The lane already applies this idea per model
+// (Lane.realOK); this is the per-node counterpart it needs to pick an exit.
+const realTrafficTrust = 5 * time.Minute
+
 func (m *Manager) ProbeAll(ctx context.Context) {
+	m.probeNodes(ctx, m.snapshotNodes(func(h *NodeHealth) bool {
+		return !(h.LastOKMs > 0 && time.Since(time.UnixMilli(h.LastOKMs)) < realTrafficTrust)
+	}))
+}
+
+// ProbeDead re-checks only the nodes currently marked dead, so a node killed by
+// a transient failure rejoins rotation without waiting for a full refresh.
+func (m *Manager) ProbeDead(ctx context.Context) {
+	m.probeNodes(ctx, m.snapshotNodes(func(h *NodeHealth) bool { return !h.Alive }))
+}
+
+func (m *Manager) snapshotNodes(keep func(*NodeHealth) bool) []NodeHealth {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	nodes := make([]NodeHealth, 0, len(m.nodes))
 	for _, n := range m.nodes {
-		if h := m.health[n.ID]; h != nil {
+		if h := m.health[n.ID]; h != nil && keep(h) {
 			nodes = append(nodes, *h)
 		}
 	}
-	m.mu.Unlock()
+	return nodes
+}
+
+func (m *Manager) probeNodes(ctx context.Context, nodes []NodeHealth) {
 	if len(nodes) == 0 {
 		return
 	}
@@ -43,12 +73,7 @@ func (m *Manager) ProbeAll(ctx context.Context) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			pctx, cancel := context.WithTimeout(ctx, probeTimeout)
-			defer cancel()
-			client := nodeClient(h.Port)
-			start := time.Now()
-			eg := lane.DetectEgressVia(pctx, client)
-			lat := int(time.Since(start).Milliseconds())
+			eg, lat := m.probeOnce(ctx, h.Port)
 			m.mu.Lock()
 			defer m.mu.Unlock()
 			if cur := m.health[h.ID]; cur != nil {
@@ -58,14 +83,54 @@ func (m *Manager) ProbeAll(ctx context.Context) {
 					cur.LatencyMs = 0
 					cur.IP, cur.Country = "", ""
 				} else {
-					cur.Alive = true
-					cur.IP, cur.Country = eg.IP, eg.Country
-					cur.LatencyMs = lat
+					m.reviveNode(cur, eg, lat)
 				}
 			}
 		}(h)
 	}
 	wg.Wait()
+}
+
+// reviveNode marks a node alive after a successful probe and clears every
+// failure counter, so it rejoins rotation with a clean slate. Caller holds
+// m.mu.
+func (m *Manager) reviveNode(cur *NodeHealth, eg lane.Egress, lat int) {
+	cur.Alive = true
+	cur.IP, cur.Country = eg.IP, eg.Country
+	cur.LatencyMs = lat
+	cur.CoolUntil = 0 // a live egress is proof enough to rejoin rotation now
+	delete(m.nodeStreak, cur.ID)
+	// The tunnel answered again: the strike counter from ReportDead must
+	// restart, or the first post-revival failure would instantly retire the
+	// node a second time and the "two consecutive strikes" rule would
+	// silently become "one, forever".
+	delete(m.nodeFails, cur.ID)
+	delete(m.nodeFailAt, cur.ID)
+}
+
+// probeOnce dials out through one node's socks inbound, re-trying the whole
+// round-trip before it reports an empty egress.
+func (m *Manager) probeOnce(ctx context.Context, port int) (lane.Egress, int) {
+	var eg lane.Egress
+	var lat int
+	for try := 0; try < probeNodeRoundtrips; try++ {
+		pctx, cancel := context.WithTimeout(ctx, probeTimeout)
+		client := nodeClient(port)
+		start := time.Now()
+		eg = lane.DetectEgressVia(pctx, client)
+		lat = int(time.Since(start).Milliseconds())
+		cancel()
+		if eg.IP != "" {
+			return eg, lat
+		}
+		if ctx.Err() != nil {
+			return eg, lat
+		}
+		if try+1 < probeNodeRoundtrips {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	return eg, lat
 }
 
 // nodeClient builds an HTTP client whose egress is one node's local socks
@@ -91,22 +156,23 @@ func (m *Manager) Dial(ctx context.Context, network, addr string) (net.Conn, err
 		// resolved at the node (the CONNECT request carries the hostname).
 		dialer, derr := proxy.SOCKS5("tcp", fmt.Sprintf("127.0.0.1:%d", h.Port), nil, proxy.Direct)
 		if derr != nil {
-			m.park(h.ID)
+			m.coolNode(h.ID)
 			continue
 		}
 		cd, ok := dialer.(proxy.ContextDialer)
 		if !ok {
-			m.park(h.ID)
+			m.coolNode(h.ID)
 			continue
 		}
 		conn, derr := cd.DialContext(ctx, network, addr)
 		if derr != nil {
-			m.park(h.ID)
+			m.coolNode(h.ID)
 			if ctx.Err() != nil {
 				return nil, derr
 			}
 			continue
 		}
+		m.warmNode(h.ID)
 		return conn, nil
 	}
 	return nil, fmt.Errorf("所有订阅节点都拨号失败(%d 个健康节点)", m.Healthy())
@@ -135,6 +201,37 @@ func (m *Manager) park(id string) {
 		h.CoolUntil = time.Now().Add(coolDuration).UnixMilli()
 	}
 	m.mu.Unlock()
+}
+
+// coolNode parks a node after a dial failure, escalating the park duration with
+// consecutive failures so a persistently dead node stops costing a full
+// dialTimeout on every request. One failure parks for coolDuration; each repeat
+// doubles it (capped at 15m) -- the node-level mirror of the (exit, model)
+// ledger's adaptive delay in ledger.go.
+func (m *Manager) coolNode(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.nodeStreak == nil {
+		m.nodeStreak = make(map[string]int)
+	}
+	m.nodeStreak[id]++
+	n := m.nodeStreak[id]
+	d := coolDuration << min(n-1, 4) // 1m, 2m, 4m, 8m, 16m
+	if d > 15*time.Minute {
+		d = 15 * time.Minute
+	}
+	if h := m.health[id]; h != nil {
+		h.CoolUntil = time.Now().Add(d).UnixMilli()
+	}
+}
+
+// warmNode clears a node's consecutive-failure streak after a successful dial
+// (or a live probe / served request), so a node that recovers rejoins rotation
+// at the base cooldown instead of carrying stale escalation.
+func (m *Manager) warmNode(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.nodeStreak, id)
 }
 
 var _ lane.Rotator = (*Manager)(nil)

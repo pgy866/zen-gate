@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build darwin && !headless
 
 package window
 
@@ -12,8 +12,8 @@ import "C"
 import (
 	"unsafe"
 
-	_ "zen-gate/internal/window/cocoa"
 	"zen-gate/internal/tray"
+	_ "zen-gate/internal/window/cocoa"
 )
 
 // macOS has no HWND. Callers only ever compare the handle against zero to ask

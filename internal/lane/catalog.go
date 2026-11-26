@@ -12,6 +12,7 @@ type ModelInfo struct {
 	Name               string `json:"name"`
 	Blurb              string `json:"blurb,omitempty"`     // 一行小介绍：社区评价 + 性能定位 + 推荐度
 	Wire               string `json:"wire"`                // chat | responses | messages | systemone
+	Channel            string `json:"channel,omitempty"`   // "" | "kilo" — which free source serves this id
 	SystemOne          bool   `json:"systemOne,omitempty"` // decision model, not chat-capable
 	Vision             bool   `json:"vision"`
 	AudioInput         bool   `json:"audioInput,omitempty"`
@@ -22,6 +23,27 @@ type ModelInfo struct {
 	CanDisableThinking bool   `json:"canDisableThinking"`
 	RegionSensitive    bool   `json:"regionSensitive"`
 }
+
+// Channel tags for the catalog's free sources. The empty channel is the
+// OpenCode Zen lane itself; ChannelKilo is the keyless Kilo free pool;
+// ChannelWorkBuddy is the WorkBuddy 账号渠道 (intl); ChannelCodeArts is the
+// Huawei Cloud CodeArts 账号渠道, the credential-bearing fourth source.
+const (
+	// ChannelZen names the OpenCode Zen lane in the per-channel files and in
+	// the dashboard. The catalog leaves a zen row's Channel empty (the empty
+	// channel *is* zen), so this constant exists for the places that need the
+	// id as a string: channels/<id>.json, the admin state, the wall.
+	ChannelZen       = "zen"
+	ChannelKilo      = "kilo"
+	ChannelWorkBuddy = "workbuddy"
+	ChannelCodeArts  = "codearts"
+	ChannelZCode     = "zcode"
+	ChannelTrae      = "trae"
+	// ChannelQoder names the sidecar-hosted Qoder pool. It has no catalog rows
+	// of its own: its models arrive as a custom provider entry the gateway
+	// syncs, which is why the wall reads its state straight from the sidecar.
+	ChannelQoder = "qoder"
+)
 
 var alwaysFree = map[string]bool{"union-alpha": true, "space-bunny-free": true}
 
@@ -54,22 +76,42 @@ type capability struct {
 // actually accepted under a direct probe, not what a model card claims.
 // audio/file stay false until verified (a live probe or the AI tagger upgrades
 // them) — an unverified modality must never receive that modality's traffic.
+//
+// The 2026-10-15 rows (deepseek-v4.1-flash-free, ll-alpha-free,
+// nemotron-3.5-super-vl-free, glm-5.3-flash-free) are measured, not guessed:
+// each was probed against the live lane with the v2 fingerprint — context by
+// sweeping prompt sizes until the upstream refused, output by raising
+// max_tokens until it refused, vision by sending a 1×1 PNG. Context figures
+// are the largest accepted size rounded down to a sane boundary; where the
+// sweep was inconclusive (glm's large requests kept drawing transient 429s)
+// the row carries only what was actually proven.
 var capabilities = []capability{
 	{regexp.MustCompile(`^mimo.*v2\.6`), true, false, false, true, 1048576, 131072, false},
 	{regexp.MustCompile(`^mimo.*v2\.5`), true, false, false, true, 1048576, 131072, false},
 	{regexp.MustCompile(`^mimo`), true, false, false, true, 262144, 131072, true},
-	{regexp.MustCompile(`^muse.?spark`), true, false, false, true, 1048576, 131072, true},
+	{regexp.MustCompile(`^muse.?spark`), true, false, false, true, 1048576, 943718, true},
+	{regexp.MustCompile(`^step`), false, false, false, true, 1000000, 64000, true},
+	{regexp.MustCompile(`^nemotron.*super.?vl`), true, false, false, true, 1048576, 262144, true},
 	{regexp.MustCompile(`^nemotron`), false, false, false, true, 128000, 32768, true},
 	{regexp.MustCompile(`^ling`), false, false, false, true, 262144, 32768, true},
 	{regexp.MustCompile(`^space.?bunny`), true, false, false, true, 1048576, 65536, true},
 	{regexp.MustCompile(`^union`), true, false, false, false, 262144, 131072, true},
+	{regexp.MustCompile(`^deepseek.*v4\.1`), true, false, false, true, 1048576, 262144, true},
 	{regexp.MustCompile(`^deepseek`), false, false, false, true, 1048576, 65536, true},
-	{regexp.MustCompile(`^longcat`), true, false, false, true, 1048576, 32768, true},
+	{regexp.MustCompile(`^ll.?alpha`), true, false, false, true, 1048576, 131072, true},
+	{regexp.MustCompile(`^glm`), false, false, false, true, 524288, 262144, true},
+	{regexp.MustCompile(`^longcat`), true, false, false, true, 1048576, 262144, true},
 	{regexp.MustCompile(`^fledge`), false, false, false, true, 131072, 32768, true},
 	{regexp.MustCompile(`^jev`), false, false, false, false, 32768, 4096, true},
 }
 
-var regionSensitiveRes = []*regexp.Regexp{regexp.MustCompile(`^muse.?spark`)}
+// regionSensitiveRes marks models a CN egress cannot reach: the upstream
+// answers RegionError rather than a quota refusal, and routing to them just
+// wastes a turn. beam-free refused from a CN probe on 2026-10-15.
+var regionSensitiveRes = []*regexp.Regexp{
+	regexp.MustCompile(`^muse.?spark`),
+	regexp.MustCompile(`^beam`),
+}
 
 var displayNames = map[string]string{
 	"mimo-v2.6-flash-free":            "MiMo V2.6 Flash",
@@ -78,10 +120,15 @@ var displayNames = map[string]string{
 	"muse-spark-1.2-contributor-free": "Muse Spark 1.2",
 	"nemotron-3-ultra-free":           "Nemotron 3 Ultra",
 	"nemotron-3.5-lightning-free":     "Nemotron 3.5 Lightning",
+	"nemotron-3.5-super-vl-free":      "Nemotron 3.5 Super VL",
 	"ling-3.0-flash-fin-free":         "Ling 3.0 Flash Fin",
 	"space-bunny-free":                "Space Bunny",
 	"union-alpha":                     "Union Alpha",
 	"deepseek-v4-flash-free":          "DeepSeek V4 Flash",
+	"deepseek-v4.1-flash-free":        "DeepSeek V4.1 Flash",
+	"ll-alpha-free":                   "LL Alpha",
+	"glm-5.3-flash-free":              "GLM 5.3 Flash",
+	"beam-free":                       "Beam",
 	"jev-1.13-free":                   "Jev 1.13",
 }
 
@@ -100,6 +147,11 @@ var blurbs = map[string]string{
 	"space-bunny-free":                "匿名 1M 上下文模型，OpenCode 用量榜第一（周 63T tokens）、社区口碑好，来头未公开。推荐 ★★★★☆",
 	"union-alpha":                     "r/opencode 社区常推的免费模型，综合约 GPT-4.5+ 水平。推荐 ★★★★",
 	"deepseek-v4-flash-free":          "DeepSeek V4 Flash：速度优先，首字快 40-60%、输出 ~214 tok/s，1M 上下文，官方称体验全面超越自家 Pro，综合对位 GPT-5 级。推荐 ★★★★★（速度之王）",
+	"deepseek-v4.1-flash-free":        "DeepSeek V4.1 Flash：10-15 天下架的新旗舰，实测 1M+ 上下文、256K 输出上限、接受图片输入，是目前免费车道里上下文与输出都给得最大方的模型之一。推荐 ★★★★★（长文档 / 大输出一首选）",
+	"ll-alpha-free":                   "来路不明的免费模型，实测 1M 上下文、128K 输出、接受图片；能力未标定，先按 GPT-4.5~5 之间试水。推荐 ★★★（尝鲜）",
+	"nemotron-3.5-super-vl-free":      "NVIDIA 的多模态加强版（VL = Vision-Language）：实测 1M 上下文、256K 输出、接受图片，看图与长文档都能吃。推荐 ★★★★（多模态性价比）",
+	"glm-5.3-flash-free":              "智谱 GLM 5.3 Flash 轻量版，实测 256K 输出上限；实测期间上游间歇性返回 429（Endpoint unavailable），可用性波动较大。推荐 ★★★（看状态再用）",
+	"beam-free":                       "新上架模型，但 CN 出口直接被上游地区门拦下（RegionError），只有海外出口才用得上。推荐 ★★（有海外出口再开）",
 	"longcat-2.5-preview-free":        "美团 LongCat 2.5 预览：万亿级动态稀疏 MoE、百万上下文，国产算力全流程训练。推荐 ★★★★",
 	"fledge-alpha-free":               "新上架的神秘面孔，社区评价还少；先按 GPT-4.5 级试水。推荐 ★★★（尝鲜）",
 	"jev-1.13-free":                   "TypeSafe AI 的 System One 判定模型：只答 choice/score/noul 三类结构化决策，不做内容生成，给 Agent 当意图/情绪判定层。推荐 ★★（别拿来聊天）",
@@ -128,7 +180,20 @@ func capabilitiesFor(base string) capability {
 			return c
 		}
 	}
-	return capability{vision: false, audio: false, file: false, reasoning: true, contextWindow: 131072, maxOutput: 32768, canDisableThinking: true}
+	// Nothing is known about this model, so nothing is claimed: a guessed
+	// reasoning:true showed up on the model page as a verified 思考 badge.
+	return capability{vision: false, audio: false, file: false, reasoning: false, contextWindow: 131072, maxOutput: 32768, canDisableThinking: true}
+}
+
+// CapabilityMatched reports whether the local table states anything about a
+// model — false means capabilitiesFor() answered with its defaults.
+func CapabilityMatched(base string) bool {
+	for _, c := range capabilities {
+		if c.match.MatchString(base) {
+			return true
+		}
+	}
+	return false
 }
 
 // BuildCatalog merges the upstream listing with the local capability table,
@@ -176,23 +241,204 @@ func BuildCatalog(ids []string) []ModelInfo {
 	return entries
 }
 
-// FallbackCatalogIDs covers a cold start with no network.
+// FallbackCatalogIDs covers a cold start with no network. Mirrors the live
+// free roster as of 2026-10-15 (mimo-v2.5 / ling-3.0-flash-fin / nemotron-3-ultra
+// / deepseek-v4-flash have since left the upstream listing).
 var FallbackCatalogIDs = []string{
-	"mimo-v2.6-flash-free", "mimo-v2.5-free", "ling-3.0-flash-fin-free",
-	"nemotron-3-ultra-free", "nemotron-3.5-lightning-free", "space-bunny-free",
+	"mimo-v2.6-flash-free", "deepseek-v4.1-flash-free", "space-bunny-free",
+	"nemotron-3.5-lightning-free", "nemotron-3.5-super-vl-free",
+	"ll-alpha-free", "glm-5.3-flash-free", "longcat-2.5-preview-free",
 	"muse-spark-1.3-contributor-free", "muse-spark-1.2-contributor-free",
+	"union-alpha", "beam-free", "jev-1.13-free",
+}
+
+// ListingMeta is one upstream model row: its id plus whatever the provider
+// itself declares about it. Zero bools mean "not stated" unless the matching
+// *Declared flag says otherwise.
+type ListingMeta struct {
+	ID             string `json:"id"`
+	Name           string `json:"name,omitempty"` // the provider's own display name
+	ContextWindow  int    `json:"contextWindow,omitempty"`
+	MaxOutput      int    `json:"maxOutput,omitempty"`
+	Vision         bool   `json:"vision,omitempty"`
+	Audio          bool   `json:"audio,omitempty"`
+	File           bool   `json:"file,omitempty"`
+	Reasoning      bool   `json:"reasoning,omitempty"`
+	InputDeclared  bool   `json:"inputDeclared,omitempty"`  // input_modalities were stated
+	OutputDeclared bool   `json:"outputDeclared,omitempty"` // output_modalities were stated
+
+	// Efforts are the thinking rungs the provider publishes for this model, in
+	// the provider's own naming, lightest first. EffortDefault is whichever of
+	// them the provider turns on when the caller states nothing. Both empty
+	// means the listing said nothing about thinking levels — the gateway then
+	// falls back to its own budget ladder instead of claiming rungs the
+	// upstream has never heard of.
+	Efforts       []string `json:"efforts,omitempty"`
+	EffortDefault string   `json:"effortDefault,omitempty"`
+}
+
+// dig walks a decoded-JSON path: a string step is an object key, an int step
+// indexes an array. Any missing or mis-typed step yields nil.
+func dig(v any, path ...any) any {
+	cur := v
+	for _, step := range path {
+		switch s := step.(type) {
+		case string:
+			obj, ok := cur.(map[string]any)
+			if !ok {
+				return nil
+			}
+			cur = obj[s]
+		case int:
+			list, ok := cur.([]any)
+			if !ok || s >= len(list) {
+				return nil
+			}
+			cur = list[s]
+		}
+		if cur == nil {
+			return nil
+		}
+	}
+	return cur
+}
+
+func numberAt(v any, path ...any) int {
+	if n, ok := dig(v, path...).(float64); ok && n > 0 {
+		return int(n)
+	}
+	return 0
+}
+
+func stringAt(v any, path ...any) string {
+	s, _ := dig(v, path...).(string)
+	return s
+}
+
+// firstString returns the first key that holds a non-empty string.
+func firstString(row map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if s, ok := row[k].(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
+}
+
+// applyModalitySchema reads the per-modality declaration shape some providers
+// publish (schema_version 2.4 style): input_modalities carries the context
+// window and the accepted media types, output_modalities carries the output cap
+// and whether a reasoning switch exists. Absent the block, nothing is claimed —
+// an unlisted modality is then "unknown", not "refused".
+func applyModalitySchema(row map[string]any, meta *ListingMeta) {
+	if inputs, ok := row["input_modalities"].([]any); ok {
+		meta.InputDeclared = true
+		for _, item := range inputs {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch strings.ToLower(stringAt(m, "type")) {
+			case "image":
+				meta.Vision = true
+			case "audio":
+				meta.Audio = true
+			case "file", "document", "pdf":
+				meta.File = true
+			}
+			if n := numberAt(m, "supported_inputs", "max_context_length", "value"); n > 0 && meta.ContextWindow == 0 {
+				meta.ContextWindow = n
+			}
+		}
+	}
+	outputs, ok := row["output_modalities"].([]any)
+	if !ok {
+		return
+	}
+	meta.OutputDeclared = true
+	for _, item := range outputs {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if dig(m, "supported_parameters", "reasoning") != nil {
+			meta.Reasoning = true
+		}
+		n := numberAt(m, "max_length", "value")
+		if n == 0 {
+			n = numberAt(m, "supported_parameters", "max_tokens", "max")
+		}
+		if n > 0 && meta.MaxOutput == 0 {
+			meta.MaxOutput = n
+		}
+	}
+}
+
+// Declared-capacity field names seen in the wild: NVIDIA NIM splits input and
+// output caps, OpenRouter publishes one total window plus a completion cap.
+// Order is a preference — an input cap is the tighter, more honest bound for
+// routing than a viewer-wide token allowance.
+var (
+	declaredContextKeys = []string{"max_input_tokens", "context_length", "viewer_total_token_limit", "context_window"}
+	declaredOutputKeys  = []string{"max_output_tokens", "max_completion_tokens"}
+)
+
+func declaredInt(row map[string]any, keys ...string) int {
+	for _, k := range keys {
+		// encoding/json numbers everything as float64.
+		if n, ok := row[k].(float64); ok && n > 0 {
+			return int(n)
+		}
+	}
+	return 0
+}
+
+// listingRows returns the model rows of a listing payload, or nil when the
+// payload carries no recognisable list.
+func listingRows(payload map[string]any) []any {
+	if d, ok := payload["data"].([]any); ok {
+		return d
+	}
+	if d, ok := payload["models"].([]any); ok {
+		return d
+	}
+	return nil
+}
+
+// ParseListingMeta reads the listing keeping each row's declared capacities.
+// Rows without an id are dropped; rows without numbers are kept, so a caller
+// can tell "the provider published nothing" apart from "the provider was
+// unreachable".
+func ParseListingMeta(payload map[string]any) []ListingMeta {
+	rows := []ListingMeta{}
+	for _, row := range listingRows(payload) {
+		switch t := row.(type) {
+		case string:
+			if id := strings.TrimSpace(t); id != "" {
+				rows = append(rows, ListingMeta{ID: id})
+			}
+		case map[string]any:
+			id, _ := t["id"].(string)
+			id = strings.TrimSpace(id)
+			if id == "" {
+				continue
+			}
+			rows = append(rows, ListingMeta{
+				ID:            id,
+				Name:          firstString(t, "name", "display_name"),
+				ContextWindow: declaredInt(t, declaredContextKeys...),
+				MaxOutput:     declaredInt(t, declaredOutputKeys...),
+			})
+			applyModalitySchema(t, &rows[len(rows)-1])
+		}
+	}
+	return rows
 }
 
 // ParseListing accepts {"data":[{"id":…}]}, {"models":[…]} or a bare array.
 func ParseListing(payload map[string]any) []string {
-	var rows []any
-	if d, ok := payload["data"].([]any); ok {
-		rows = d
-	} else if d, ok := payload["models"].([]any); ok {
-		rows = d
-	}
 	ids := []string{}
-	for _, row := range rows {
+	for _, row := range listingRows(payload) {
 		switch t := row.(type) {
 		case string:
 			ids = append(ids, t)

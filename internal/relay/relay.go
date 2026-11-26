@@ -17,11 +17,139 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"zen-gate/internal/lane"
 	"zen-gate/internal/store"
 )
+
+// providerStreamIdle bounds silence on a relayed stream — both the wait for
+// the first frame after the 200 and the gap between frames. A user-added
+// upstream can accept the request, send headers, then queue: observed on
+// NVIDIA NIM's free tier with harness-sized prompts, where the body stayed
+// silent for minutes while the client aborted on its own patience (access log
+// read ABORTED at 20-44s with no in/out at all). Every received byte resets
+// the clock, so a slow-but-live answer is never cut; 30s of true silence on a
+// direct endpoint is a stuck request, not a queued one worth hanging for.
+// A var so tests can shrink the bound.
+var providerStreamIdle = 30 * time.Second
+
+// providerHeaderBound caps the wait for response headers on a relayed turn.
+// The lane's shared transport holds this at 90s — tuned for rotating egress —
+// but a user-added upstream that opens the socket and then never answers is
+// the exact shape observed on NVIDIA NIM's free queue: the client gave up at
+// 20s (ABORTED, attempts=1, failover never saw it). Cutting the header wait
+// at 30s turns that into a clean TRANSPORT error the gateway can report or
+// retry. A var so tests can shrink it.
+var providerHeaderBound = 30 * time.Second
+
+// relayHTTP returns the relay's own client: the lane's shared transport
+// cloned with the tighter header bound, and no end-to-end Timeout (a long
+// answer is fine — what is bounded is silence, phase by phase). The clone is
+// rebuilt when SetProxy swaps the base transport, so proxy mode stays honoured.
+var (
+	relayMu     sync.Mutex
+	relayBase   http.RoundTripper
+	relayClient *http.Client
+)
+
+func relayHTTP() *http.Client {
+	relayMu.Lock()
+	defer relayMu.Unlock()
+	c := lane.Client()
+	if relayClient != nil && c.Transport == relayBase {
+		return relayClient
+	}
+	cl := *c
+	if t, ok := c.Transport.(*http.Transport); ok {
+		ct := t.Clone()
+		ct.ResponseHeaderTimeout = providerHeaderBound
+		cl.Transport = ct
+		cl.Timeout = 0 // bounded per-phase, not end-to-end: a long answer is fine
+	} else {
+		cl.Timeout = providerHeaderBound
+	}
+	relayBase = c.Transport
+	relayClient = &cl
+	return relayClient
+}
+
+// OnCacheRefused, when set, is told that a provider rejected the
+// cache-declaring request shape. The gateway persists NoCache through it so the
+// refusal is learned once instead of rediscovered on every turn; nil (tests,
+// headless embeds) keeps the fallback purely per-request.
+//
+// Guarded by a mutex because Complete runs on request goroutines while a test
+// or a second Server may install it concurrently. Assign with
+// SetCacheRefusedHandler rather than writing this directly.
+var (
+	cacheRefusedMu sync.RWMutex
+	onCacheRefused func(providerID string)
+)
+
+// SetCacheRefusedHandler installs (or clears, with nil) the provider-refusal
+// callback.
+func SetCacheRefusedHandler(fn func(providerID string)) {
+	cacheRefusedMu.Lock()
+	onCacheRefused = fn
+	cacheRefusedMu.Unlock()
+}
+
+// cacheRefusal reports whether an upstream error is a rejection of the CACHE
+// FIELDS this gateway added, which is the one 4xx worth retrying in a plainer
+// shape. Everything else — a bad key, an unknown model, a malformed tool
+// schema — is the caller's problem and re-sending it unchanged would only
+// double the bill.
+//
+// The code accepted here is CodeServer, not CodeClient: ClassifyFailure files a
+// 400 as an *unavailable-model* verdict (CodeServer + Unavailable), because a
+// 400 on this lane usually means "this model will not serve this id".
+//
+// The payload rule is deliberately narrow. "unexpected field" alone is NOT
+// enough — any upstream refusing any unknown field says that, including one
+// objecting to a parameter the user configured themselves, and re-sending such
+// a request pays twice for an answer that cannot change. A generic phrase only
+// counts when a cache-specific word appears in the SAME message, which by
+// construction names a field this gateway is the one that added.
+func cacheRefusal(err *lane.UpstreamError) bool {
+	if err == nil {
+		return false
+	}
+	switch err.Code {
+	case lane.CodeClient, lane.CodeServer:
+	default:
+		return false
+	}
+	m := strings.ToLower(err.Message)
+	cacheish := []string{"cache_control", "cache control", "prompt_cache", "cache key",
+		"cached_tokens", "cache_read", "cache_creation"}
+	for _, needle := range cacheish {
+		if strings.Contains(m, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// dropCacheKey removes the OpenAI-side bucket key, for a provider that refused
+// the field rather than the block shape.
+func dropCacheKey(body map[string]any) bool {
+	if _, has := body["prompt_cache_key"]; !has {
+		return false
+	}
+	delete(body, "prompt_cache_key")
+	return true
+}
+
+func onCacheRefusedNotify(p *store.Provider) {
+	cacheRefusedMu.RLock()
+	fn := onCacheRefused
+	cacheRefusedMu.RUnlock()
+	if fn != nil {
+		fn(p.ID)
+	}
+}
 
 // NormalizeBaseURL trims and scheme-fills a provider base URL.
 func NormalizeBaseURL(raw string) string {
@@ -44,6 +172,45 @@ func authHeaders(h http.Header, apiKey, protocol string) {
 	h.Set("authorization", "Bearer "+apiKey)
 }
 
+// identityHeaders adds the session identity an opencode.ai endpoint demands.
+// Its Go tier answers a session-less turn with 400 MissingSessionID ("cannot
+// be routed efficiently") regardless of a valid key — the same session header
+// the free lane already mints, so a user pointing a provider at OpenCode Go
+// stops tripping that gate (issue #55). Every other provider gets nothing:
+// unknown headers can upset a stricter upstream, and only this host asks.
+func identityHeaders(h http.Header, p *store.Provider, session string) {
+	if session == "" || !isOpenCodeHost(p.BaseURL) {
+		return
+	}
+	h.Set("x-opencode-session", session)
+}
+
+// isOpenCodeHost reports whether a provider points at opencode.ai (the Zen
+// free lane or the paid Go tier — both gate on the session header).
+func isOpenCodeHost(baseURL string) bool {
+	host := strings.ToLower(NormalizeBaseURL(baseURL))
+	return strings.Contains(host, "//opencode.ai") || strings.Contains(host, ".opencode.ai")
+}
+
+// relaySession derives the session identity a relayed turn presents to an
+// opencode.ai endpoint: the lane's own minted id for a per-conversation seed,
+// so it carries the timestamp-shaped prefix the gate expects (#47) and stays
+// stable across the turns of one conversation. Mirrors gateway.SessionSeed
+// without importing the gateway (which imports this package).
+func relaySession(agent string, messages []lane.Message) string {
+	first := ""
+	for _, m := range messages {
+		if m.Role == lane.RoleUser {
+			first = m.TextOf()
+			break
+		}
+	}
+	if len(first) > 500 {
+		first = first[:500]
+	}
+	return lane.SessionForConversation(agent + "\x00" + first)
+}
+
 // endpointOf returns the completion URL for one provider.
 func endpointOf(p *store.Provider) string {
 	base := NormalizeBaseURL(p.BaseURL)
@@ -53,10 +220,11 @@ func endpointOf(p *store.Provider) string {
 	return base + "/chat/completions"
 }
 
-// FetchModels pulls the model listing from a provider endpoint. Both protocol
-// families answer GET {base}/models with {"data":[{"id":…}]}, so one parse
-// path covers them; lane.ParseListing also tolerates bare arrays.
-func FetchModels(ctx context.Context, baseURL, apiKey, protocol string) ([]string, error) {
+// FetchModelCatalog pulls the model listing from a provider endpoint and keeps
+// the token capacities the provider declares alongside each id. Both protocol
+// families answer GET {base}/models with {"data":[{"id":…}]}, so one parse path
+// covers them; lane.ParseListingMeta also tolerates bare arrays.
+func FetchModelCatalog(ctx context.Context, baseURL, apiKey, protocol string) ([]lane.ListingMeta, error) {
 	base := NormalizeBaseURL(baseURL)
 	if base == "" {
 		return nil, errors.New("Base URL 不能为空")
@@ -85,9 +253,22 @@ func FetchModels(ctx context.Context, baseURL, apiKey, protocol string) ([]strin
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return nil, fmt.Errorf("响应不是 JSON 对象: %v", err)
 	}
-	ids := lane.ParseListing(payload)
-	if len(ids) == 0 {
+	rows := lane.ParseListingMeta(payload)
+	if len(rows) == 0 {
 		return nil, errors.New("模型列表为空（检查 Base URL 与 Key）")
+	}
+	return rows, nil
+}
+
+// FetchModels returns just the ids of a provider's listing.
+func FetchModels(ctx context.Context, baseURL, apiKey, protocol string) ([]string, error) {
+	rows, err := FetchModelCatalog(ctx, baseURL, apiKey, protocol)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, r.ID)
 	}
 	return ids, nil
 }
@@ -100,6 +281,20 @@ type Turn struct {
 	Tools     []lane.ToolDef
 	MaxTokens int    // ≤ 0 → provider default
 	Agent     string // caller label for stats
+	// Session is a stable per-conversation identity. Only some upstreams want
+	// it: an opencode.ai endpoint rejects a turn that arrives without
+	// x-opencode-session ("cannot be routed efficiently", issue #55), and the
+	// value must repeat across a conversation for routing and prompt cache to
+	// hold. Empty is fine for every other provider.
+	Session string
+
+	// ReasoningEffort is the thinking rung the caller asked for, already in the
+	// naming this provider answers to. It rides the OpenAI body verbatim
+	// because a provider that publishes rungs acts on them — dropping it is
+	// what made the picker a no-op. Anthropic-protocol providers are left
+	// alone: their thinking control is a budget object, not a level name, and
+	// inventing one would be a claim about a field they may reject.
+	ReasoningEffort string
 }
 
 // Complete streams one turn from the provider into lane chunks. Returns the
@@ -108,6 +303,10 @@ type Turn struct {
 // the chunks instead.
 func Complete(ctx context.Context, t Turn, emit func(lane.Chunk)) (lane.Usage, string, *lane.UpstreamError) {
 	p := t.Provider
+	session := t.Session
+	if session == "" {
+		session = relaySession(t.Agent, t.Messages)
+	}
 	protocol := p.Protocol
 	wire := "chat"
 	if protocol == store.ProtocolAnthropic {
@@ -136,21 +335,72 @@ func Complete(ctx context.Context, t Turn, emit func(lane.Chunk)) (lane.Usage, s
 		if tl := lane.ToToolDefs(t.Tools, style); tl != nil {
 			body["tools"] = tl
 		}
+		// Prefix caching on this wire is declared inline. One breakpoint on the
+		// last system block covers the whole system prompt and one on the last
+		// tool covers every schema before it — 2 of the 4 slots a request may
+		// carry, spent on the two prefixes a conversation resends verbatim.
+		// Skipped for a provider that already refused the block shape.
+		if !p.NoCache {
+			lane.WithCacheBreakpoints(body)
+		}
 	default:
 		body["messages"] = lane.ToChatMessages(msgs)
 		body["max_tokens"] = maxTok
 		if tl := lane.ToToolDefs(t.Tools, style); tl != nil {
 			body["tools"] = tl
 		}
+		if t.ReasoningEffort != "" {
+			body["reasoning_effort"] = t.ReasoningEffort
+		}
 		body["stream_options"] = map[string]any{"include_usage": true}
+		// OpenAI-compatible gateways bucket their prefix cache by this field. It
+		// has to be the conversation, not the request: the whole point is that
+		// turn N+2 lands in the bucket turn N created. A provider that refused
+		// it once keeps its requests clean from then on.
+		if !p.NoCache {
+			lane.WithCacheKey(body, wire, session)
+		}
 	}
 
 	decoder := lane.NewDecoder(wire, nil, emit)
-	usage, err := postStreamed(ctx, p, body, func(payload []byte) error {
+	// sawFrame records that the upstream started streaming, i.e. that this was
+	// not a refusal at the head. A cache-field 400 is answered before any frame,
+	// so a refusal with frames behind it is a different animal — replaying it
+	// would duplicate whatever already reached the client.
+	sawFrame := false
+	usage, err := postStreamed(ctx, p, session, body, func(payload []byte) error {
+		if len(payload) > 0 {
+			sawFrame = true
+		}
 		decoder.Decode(payload)
 		return nil
 	})
 	result := decoder.Finish()
+	// An upstream that refuses the cache-declaring shape answers 400 and quotes
+	// the field it did not like. That verdict is about OUR body, not the key,
+	// so: retry once in the plain shape, then remember the refusal on the
+	// provider — one bad guess costs one retry, not one failed turn per request
+	// for the rest of time.
+	//
+	// Two conditions keep the retry honest:
+	//
+	//   - nothing may have reached the client yet. A refusal at the head emits
+	//     nothing, so this is the normal case; a mid-stream error means the
+	//     turn is committed and replaying it would duplicate the answer.
+	//   - the retry gets a FRESH decoder. Reusing one that already decoded a
+	//     frame would fold the same text in twice (the decoder accumulates
+	//     block state, it does not replace it).
+	if err != nil && cacheRefusal(err) && !p.NoCache && !sawFrame {
+		if lane.StripCacheBreakpoints(body) || dropCacheKey(body) {
+			retryDecoder := lane.NewDecoder(wire, nil, emit)
+			usage, err = postStreamed(ctx, p, session, body, func(payload []byte) error {
+				retryDecoder.Decode(payload)
+				return nil
+			})
+			result = retryDecoder.Finish()
+			onCacheRefusedNotify(p)
+		}
+	}
 	if usage != nil && result.Usage.TotalTokens == 0 {
 		result.Usage = *usage
 	}
@@ -168,14 +418,14 @@ func Complete(ctx context.Context, t Turn, emit func(lane.Chunk)) (lane.Usage, s
 // 探测 button. Kept trivial: one listing fetch, latency of that round trip.
 func ProbeTiming(ctx context.Context, p *store.Provider) (int64, error) {
 	t0 := time.Now()
-	_, err := FetchModels(ctx, p.BaseURL, p.APIKey, p.Protocol)
+	_, err := FetchModels(ctx, p.BaseURL, FirstKey(p), p.Protocol)
 	return time.Since(t0).Milliseconds(), err
 }
 
 // postStreamed POSTs one completion and pumps `data:` frames to onData,
 // merging usage frames along the way. Mirrors lane.PostStreamed's contract
 // (idle-tolerant read owned by the request context) against an arbitrary URL.
-func postStreamed(ctx context.Context, p *store.Provider, body map[string]any, onData func([]byte) error) (*lane.Usage, *lane.UpstreamError) {
+func postStreamed(ctx context.Context, p *store.Provider, session string, body map[string]any, onData func([]byte) error) (*lane.Usage, *lane.UpstreamError) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, &lane.UpstreamError{Code: lane.CodeTransport, Message: err.Error()}
@@ -186,13 +436,18 @@ func postStreamed(ctx context.Context, p *store.Provider, body map[string]any, o
 	}
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("accept", "text/event-stream")
-	authHeaders(req.Header, p.APIKey, p.Protocol)
+	key := keyFor(p)
+	authHeaders(req.Header, key, p.Protocol)
+	identityHeaders(req.Header, p, session)
 
-	resp, err := lane.Client().Do(req)
+	resp, err := relayHTTP().Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, &lane.UpstreamError{Code: lane.CodeAborted, Message: "cancelled"}
 		}
+		// A header-wait that hit ResponseHeaderTimeout reads as a net timeout
+		// error with no ctx cancellation — that is the queued-forever shape,
+		// classify it as a transport fault the caller can retry or report.
 		return nil, &lane.UpstreamError{Code: lane.CodeTransport, Message: err.Error()}
 	}
 	defer resp.Body.Close()
@@ -205,10 +460,25 @@ func postStreamed(ctx context.Context, p *store.Provider, body map[string]any, o
 				retryAfter = n
 			}
 		}
-		return nil, lane.ClassifyFailure(resp.StatusCode, string(data), retryAfter)
+		ue := lane.ClassifyFailure(resp.StatusCode, string(data), retryAfter)
+		// A refusal that names one of OUR cache fields is not the key's fault:
+		// the same key answers fine once the field is gone. Penalising it here
+		// would bench a healthy key over a body this gateway built, and the
+		// retry would then run on a demoted key.
+		if !cacheRefusal(ue) {
+			// The request never reached the model, so the failure — credential
+			// rejection, rate limit, server wobble — is the key's to answer for.
+			penalizeKey(p, key, resp.StatusCode, time.Duration(retryAfter)*time.Second)
+		}
+		return nil, ue
 	}
 
-	br := bufio.NewReaderSize(resp.Body, 64*1024)
+	// Idle-bounded pump: an upstream that answers 200 and then queues in
+	// silence gets cut at providerStreamIdle instead of hanging until the
+	// client gives up (the ABORTED shape that skips every retry layer).
+	pump := lane.NewStreamReader(ctx, resp.Body, providerStreamIdle)
+	defer pump.Close()
+	br := bufio.NewReaderSize(pump, 64*1024)
 	var usage *lane.Usage
 	for {
 		line, rerr := br.ReadString('\n')
@@ -235,7 +505,7 @@ func postStreamed(ctx context.Context, p *store.Provider, body map[string]any, o
 				if usage == nil {
 					usage = u
 				} else {
-					usage.Merge(u)
+					usage.MergeMax(u)
 				}
 			}
 			if _, has := frame["error"]; has {
@@ -265,9 +535,15 @@ func elapsedMS(t time.Time) int64 {
 // ProbeModel pings one provider model with the smallest streaming completion
 // and classifies the verdict like the free-lane prober does. It returns as
 // soon as the first `data:` frame arrives — availability and first-token
-// latency are the only things a probe needs.
-func ProbeModel(ctx context.Context, p *store.Provider, model string) lane.ProbeResult {
-	res := lane.ProbeResult{Model: model, State: lane.StateUnknown, At: time.Now().UnixMilli()}
+// latency are the only things a probe needs. The three phases (request out,
+// answer started, verdict) also go to the context sink, because a queued
+// private endpoint can take tens of seconds and the dashboard has to say so.
+func ProbeModel(ctx context.Context, p *store.Provider, model string) (res lane.ProbeResult) {
+	res = lane.ProbeResult{Model: model, State: lane.StateUnknown, At: time.Now().UnixMilli()}
+	lane.EmitProbeStep(ctx, lane.PhaseRequest, lane.StepRunning, 0, lane.SafeEndpoint(endpointOf(p))+" · "+model)
+	defer func() {
+		lane.EmitProbeStep(ctx, lane.PhaseVerdict, lane.StatusForProbeState(res.State), res.LatencyMs, res.Detail)
+	}()
 	// max_tokens + messages is the minimal shape both protocol families accept.
 	body := map[string]any{"model": model, "stream": true, "max_tokens": 16,
 		"messages": []map[string]any{{"role": "user", "content": "ping"}}}
@@ -283,7 +559,9 @@ func ProbeModel(ctx context.Context, p *store.Provider, model string) lane.Probe
 	}
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("accept", "text/event-stream")
-	authHeaders(req.Header, p.APIKey, p.Protocol)
+	// A one-shot probe rides the provider's first key: churning the rotation
+	// with probe traffic would park keys on cooldowns for nothing.
+	authHeaders(req.Header, FirstKey(p), p.Protocol)
 
 	client := *lane.Client()
 	client.Timeout = probeHTTPTimeout
@@ -308,34 +586,71 @@ func ProbeModel(ctx context.Context, p *store.Provider, model string) lane.Probe
 	}
 
 	br := bufio.NewReaderSize(resp.Body, 16*1024)
+	// Not every OpenAI-compatible upstream honours "stream": true. A gateway
+	// that answers with one plain JSON object (or a JSON error body) never
+	// sends a "data:" line, so the old loop read to EOF and reported
+	// "上游流在数据帧之前结束" for a model that had answered fine. Lines that
+	// carry no data frame are therefore accumulated and judged once the body
+	// ends: an error object classifies as before, any other JSON counts as an
+	// answer, and only an empty body stays "ended before a data frame".
+	var plain strings.Builder
+	sawFrame := false
 	for {
 		line, rerr := br.ReadString('\n')
-		if rerr != nil && line == "" {
-			res.Detail = "上游流在数据帧之前结束"
-			break
-		}
-		trimmed := strings.TrimRight(line, "\r\n")
-		if !strings.HasPrefix(trimmed, "data:") {
-			continue
-		}
-		if res.TTFTMs == 0 {
-			res.TTFTMs = elapsedMS(start)
-		}
-		frameText := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-		if frameText == "" || frameText == "[DONE]" {
-			break
-		}
-		var frame map[string]any
-		if json.Unmarshal([]byte(frameText), &frame) == nil {
-			if e, has := frame["error"]; has {
-				ue := lane.ClassifyFailure(0, jsonString(e), 0)
-				res.State, res.Detail = probeStateFromError(ue)
-				res.LatencyMs = elapsedMS(start)
-				return res
+		if line != "" {
+			if res.TTFTMs == 0 {
+				res.TTFTMs = elapsedMS(start)
+				lane.EmitProbeStep(ctx, lane.PhaseFirstByte, lane.StepOK, res.TTFTMs, "")
 			}
 		}
-		res.State = lane.StateAvailable
-		break
+		trimmed := strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(trimmed, "data:") {
+			sawFrame = true
+			frameText := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+			if frameText == "" || frameText == "[DONE]" {
+				break
+			}
+			var frame map[string]any
+			if json.Unmarshal([]byte(frameText), &frame) == nil {
+				if e, has := frame["error"]; has {
+					ue := lane.ClassifyFailure(0, jsonString(e), 0)
+					res.State, res.Detail = probeStateFromError(ue)
+					res.LatencyMs = elapsedMS(start)
+					return res
+				}
+			}
+			res.State = lane.StateAvailable
+			break
+		}
+		if trimmed != "" {
+			plain.WriteString(trimmed)
+			plain.WriteString("\n")
+		}
+		if rerr != nil {
+			if !sawFrame {
+				if body := strings.TrimSpace(plain.String()); body != "" {
+					res.LatencyMs = elapsedMS(start)
+					var frame map[string]any
+					if json.Unmarshal([]byte(body), &frame) == nil {
+						if e, has := frame["error"]; has {
+							ue := lane.ClassifyFailure(0, jsonString(e), 0)
+							res.State, res.Detail = probeStateFromError(ue)
+							return res
+						}
+						res.State = lane.StateAvailable
+						res.Detail = "非流式应答（上游未按 SSE 回帧）"
+						return res
+					}
+					// An HTML page or another non-JSON body: let the
+					// classifier speak — a front-proxy page names its hop.
+					ue := lane.ClassifyFailure(0, body, 0)
+					res.State, res.Detail = probeStateFromError(ue)
+					return res
+				}
+				res.Detail = "上游流在数据帧之前结束"
+			}
+			break
+		}
 	}
 	res.LatencyMs = elapsedMS(start)
 	if res.TTFTMs == 0 {
