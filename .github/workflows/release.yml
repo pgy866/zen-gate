@@ -76,7 +76,7 @@ jobs:
   # Windows and macOS runners never compile those.
   build-linux:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
 
