@@ -8,6 +8,7 @@ on:
       - "cmd/zen-gate/**"
       - "internal/**"
       - "tools/build-linux.sh"
+      - "tools/build-deb.sh"
       - "assets/**"
       - "go.mod"
       - "go.sum"
@@ -45,11 +46,16 @@ jobs:
       - name: Build AppImage
         run: tools/build-linux.sh "${{ steps.ver.outputs.version }}"
 
+      - name: Build .deb
+        run: tools/build-deb.sh "${{ steps.ver.outputs.version }}"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
-          name: zen-gate-appimage
-          path: dist/*.AppImage
+          name: zen-gate-linux
+          path: |
+            dist/*.AppImage
+            dist/*.deb
           retention-days: 30
 
       - name: Publish to Release
@@ -58,7 +64,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ github.ref_name }}"
-          assets=$(ls dist/*.AppImage)
+          assets=$(ls dist/*.AppImage dist/*.deb 2>/dev/null)
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" $assets --clobber
             gh release edit "$tag" --latest
