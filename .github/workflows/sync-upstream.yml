@@ -1,0 +1,58 @@
+name: sync upstream
+
+on:
+  schedule:
+    - cron: "0 2 * * *"  # 每天 UTC 2:00 (北京时间 10:00)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch all
+        run: |
+          git remote add upstream https://github.com/LAGcomcom/zen-gate.git || true
+          git fetch upstream --tags --prune
+
+      - name: Push all branches to fork (preserve history)
+        run: |
+          git push origin upstream/master:master 2>&1 || true
+          git push origin upstream/feat/linux-port:feat/linux-port 2>&1 || true
+          git push origin --tags 2>&1 || true
+
+      - name: Sync releases with assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          # 获取上游所有 release tag
+          upstream_tags=$(gh release list --repo LAGcomcom/zen-gate --limit 100 --json tagName -q ".[].tagName")
+          for tag in $upstream_tags; do
+            echo "=== Syncing $tag ==="
+            # 检查 fork 是否已有该 release
+            if ! gh release view "$tag" --repo ${{ github.repository }} >/dev/null 2>&1; then
+              # 创建 release（先不带 assets）
+              gh release create "$tag" --repo ${{ github.repository }} --title "$tag" --notes "同步自上游 LAGcomcom/zen-gate" 2>&1 || true
+            fi
+            # 下载上游 assets
+            rm -rf /tmp/release-assets && mkdir -p /tmp/release-assets
+            if gh release download "$tag" --repo LAGcomcom/zen-gate --dir /tmp/release-assets 2>&1; then
+              # 上传到 fork
+              gh release upload "$tag" /tmp/release-assets/* --repo ${{ github.repository }} --clobber 2>&1 || true
+            else
+              echo "WARN: download failed for $tag, skipping assets"
+            fi
+            rm -rf /tmp/release-assets
+          done
