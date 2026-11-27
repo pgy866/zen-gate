@@ -13,7 +13,7 @@ type openhands struct{}
 func newOpenHands() *openhands { return &openhands{} }
 
 func (o *openhands) Meta() (string, string, string) {
-	return "openhands", "OpenHands", "~/.openhands/settings.json 的 agent_settings.llm 指向本地网关（原值自动备份还原）"
+	return "openhands", "OpenHands", "~/.openhands/settings.json 的 llm 指向本地网关（原值自动备份还原）"
 }
 
 func (o *openhands) configDir() string { return homePath(".openhands") }
@@ -79,12 +79,18 @@ func (o *openhands) Enable(opts Options) error {
 		agentSettings["llm"] = llm
 	}
 
-	// 设置 zen-gate 配置
+	// 设置 zen-gate 配置（嵌套 llm）
 	llm["model"] = opts.DefaultModel
 	llm["api_key"] = opts.APIKey
 	llm["base_url"] = opts.BaseURL
 	// 标记 zen-gate 管理
 	agentSettings["zen_gate_managed"] = true
+
+	// 同时写入顶层字段（OpenHands 前端模型选择器从这里读取）
+	settings["llm_model"] = opts.DefaultModel
+	settings["llm_base_url"] = opts.BaseURL
+	settings["llm_api_key"] = opts.APIKey
+	settings["llm_api_key_set"] = true
 
 	out, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
@@ -113,6 +119,11 @@ func (o *openhands) Disable() error {
 	if ok {
 		delete(agentSettings, "zen_gate_managed")
 	}
+	// 清除顶层字段
+	delete(settings, "llm_model")
+	delete(settings, "llm_base_url")
+	delete(settings, "llm_api_key")
+	delete(settings, "llm_api_key_set")
 	out, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return nil
